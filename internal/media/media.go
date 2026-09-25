@@ -213,6 +213,7 @@ type Limits struct {
 	VoiceMaxSeconds int
 	VoiceMaxBytes   int64
 	FileMaxBytes    int64
+	VideoMaxBytes   int64
 }
 
 // Fetchable reports whether a reported kind can be fetched in v1 (voice notes
@@ -249,6 +250,8 @@ func MaxSendBytes(kind string, l Limits) int64 {
 		return l.ImageMaxBytes
 	case "voice":
 		return l.VoiceMaxBytes
+	case "video":
+		return l.VideoMaxBytes
 	default:
 		return l.FileMaxBytes
 	}

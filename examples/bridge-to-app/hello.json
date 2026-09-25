@@ -1,1 +1,1 @@
-{"v":1,"id":"01M3C03VTGJEG6F4BX7Y7CTQY6","type":"hello","ts":1790330400000,"payload":{"bridge":"voolo-whatsapp-bridge","version":"0.1.0","protocol":1,"os":"windows","arch":"amd64","features":["reply_context","forward"]}}
+{"v":1,"id":"01M3C03VTGJEG6F4BX7Y7CTQY6","type":"hello","ts":1790330400000,"payload":{"bridge":"voolo-whatsapp-bridge","version":"0.1.0","protocol":1,"os":"windows","arch":"amd64","features":["reply_context","forward","send_video"]}}

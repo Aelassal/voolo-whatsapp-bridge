@@ -35,10 +35,15 @@ const (
 const (
 	MaxHistoryDays       = 90
 	MaxHistoryPerChat    = 20000
-	MaxImageBytes        = 16 << 20 // 16 MiB
-	MaxVoiceSeconds      = 3600     // 60 minutes
-	MaxVoiceBytes        = 32 << 20 // 32 MiB
-	MaxFileBytes         = 32 << 20 // send_media kind "file"
+	MaxImageBytes        = 16 << 20  // 16 MiB
+	MaxVoiceSeconds      = 3600      // 60 minutes
+	MaxVoiceBytes        = 32 << 20  // 32 MiB
+	MaxFileBytes         = 100 << 20 // ceiling of limits.fileMaxBytes (rev 2)
+	DefaultFileMaxBytes  = 32 << 20  // send_media kind "file" when fileMaxBytes is absent
+	MaxVideoBytes        = 64 << 20  // ceiling of limits.videoMaxBytes (rev 2)
+	DefaultVideoMaxBytes = 16 << 20  // when videoMaxBytes is absent
+	MaxVideoSeconds      = 86400
+	MaxVideoSide         = 16384
 	MaxTextChars         = 65536
 	MaxNameChars         = 512
 	MaxJIDLen            = 128
@@ -61,6 +66,25 @@ type Limits struct {
 	VoiceMaxSeconds   int   `json:"voiceMaxSeconds"`
 	// VoiceMaxBytes is optional (added within v1 on 2026-09-25); absent means MaxVoiceBytes.
 	VoiceMaxBytes *int64 `json:"voiceMaxBytes,omitempty"`
+	// VideoMaxBytes and FileMaxBytes are optional (revision 2).
+	VideoMaxBytes *int64 `json:"videoMaxBytes,omitempty"`
+	FileMaxBytes  *int64 `json:"fileMaxBytes,omitempty"`
+}
+
+// VideoBytes returns the effective video size limit.
+func (l Limits) VideoBytes() int64 {
+	if l.VideoMaxBytes == nil {
+		return DefaultVideoMaxBytes
+	}
+	return *l.VideoMaxBytes
+}
+
+// FileBytes returns the effective document size limit.
+func (l Limits) FileBytes() int64 {
+	if l.FileMaxBytes == nil {
+		return DefaultFileMaxBytes
+	}
+	return *l.FileMaxBytes
 }
 
 // VoiceBytes returns the effective voice size limit.
@@ -116,6 +140,10 @@ type SendMedia struct {
 	Mime     string `json:"mime"`
 	Caption  string `json:"caption,omitempty"`
 	FileName string `json:"fileName,omitempty"`
+	// Video display facts (revision 2, feature send_video): optional.
+	DurationS int `json:"durationS,omitempty"`
+	Width     int `json:"width,omitempty"`
+	Height    int `json:"height,omitempty"`
 	Quote
 }
 
@@ -149,7 +177,8 @@ type commandSpec struct {
 	decode func(json.RawMessage) (any, error)
 }
 
-var limitsSpec = fieldSpec{"historyDays": true, "historyMaxPerChat": true, "imageMaxBytes": true, "voiceMaxSeconds": true, "voiceMaxBytes": false}
+var limitsSpec = fieldSpec{"historyDays": true, "historyMaxPerChat": true, "imageMaxBytes": true, "voiceMaxSeconds": true, "voiceMaxBytes": false,
+	"videoMaxBytes": false, "fileMaxBytes": false}
 
 var commandSpecs = map[string]commandSpec{
 	CmdInit: {
@@ -162,7 +191,7 @@ var commandSpecs = map[string]commandSpec{
 	CmdLogout:    {fields: fieldSpec{}, decode: decodeAs[Empty]},
 	CmdSendText:  {fields: withQuote(fieldSpec{"chatJid": true, "text": true, "outboxId": true}), decode: decodeAs[SendText]},
 	CmdSendMedia: {fields: withQuote(fieldSpec{"chatJid": true, "outboxId": true, "kind": true, "path": true, "key": true, "sha256": true, "mime": true,
-		"caption": false, "fileName": false}), decode: decodeAs[SendMedia]},
+		"caption": false, "fileName": false, "durationS": false, "width": false, "height": false}), decode: decodeAs[SendMedia]},
 	CmdMarkRead:   {fields: fieldSpec{"chatJid": true, "messageIds": true, "senderJid": false}, decode: decodeAs[MarkRead]},
 	CmdFetchMedia: {fields: fieldSpec{"chatJid": true, "messageId": true}, decode: decodeAs[FetchMedia]},
 	CmdAck:        {fields: fieldSpec{"seq": true}, decode: decodeAs[Ack]},
@@ -395,7 +424,9 @@ func validate(v any) error {
 			l.HistoryMaxPerChat < 1 || l.HistoryMaxPerChat > MaxHistoryPerChat ||
 			l.ImageMaxBytes < 1 || l.ImageMaxBytes > MaxImageBytes ||
 			l.VoiceMaxSeconds < 1 || l.VoiceMaxSeconds > MaxVoiceSeconds ||
-			(l.VoiceMaxBytes != nil && (*l.VoiceMaxBytes < 1 || *l.VoiceMaxBytes > MaxVoiceBytes)) {
+			(l.VoiceMaxBytes != nil && (*l.VoiceMaxBytes < 1 || *l.VoiceMaxBytes > MaxVoiceBytes)) ||
+			(l.VideoMaxBytes != nil && (*l.VideoMaxBytes < 1 || *l.VideoMaxBytes > MaxVideoBytes)) ||
+			(l.FileMaxBytes != nil && (*l.FileMaxBytes < 1 || *l.FileMaxBytes > MaxFileBytes)) {
 			return bad("limits")
 		}
 	case *PairPhone:
@@ -414,9 +445,15 @@ func validate(v any) error {
 			return bad("send_media")
 		}
 		switch c.Kind {
-		case "image", "voice", "file":
+		case "image", "voice", "file", "video":
 		default:
 			return bad("kind")
+		}
+		if c.Kind != "video" && (c.DurationS != 0 || c.Width != 0 || c.Height != 0) {
+			return bad("durationS, width and height are for a video")
+		}
+		if c.DurationS < 0 || c.DurationS > MaxVideoSeconds || c.Width < 0 || c.Width > MaxVideoSide || c.Height < 0 || c.Height > MaxVideoSide {
+			return bad("video facts")
 		}
 		var ok bool
 		if c.Path, ok = cleanAbs(c.Path); !ok {

@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow/types/events"
+
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/protocol"
 )
 
@@ -123,4 +125,55 @@ func jpegForTest(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+// Feature send_video: a video message with its facts; the caps of init.
+func TestSendVideoAndCaps(t *testing.T) {
+	h := newHarness(t, pairedFake)
+	h.init(map[string]any{"historyDays": 90, "historyMaxPerChat": 20000, "imageMaxBytes": 16 << 20, "voiceMaxSeconds": 3600,
+		"videoMaxBytes": 64, "fileMaxBytes": 32})
+	f := h.fake()
+	h.expectState(protocol.StateConnecting)
+	waitFor(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.connects > 0 })
+	f.dispatch(&events.Connected{})
+	h.expectState(protocol.StateConnected)
+	h.knownChat(f)
+	video := bytes.Repeat([]byte{0, 0, 0, 0x18, 'f', 't', 'y', 'p'}, 8) // 64 bytes
+	s := sealForTest(t, h.mediaDir, video)
+	h.cmd("send_media", map[string]any{"chatJid": alice, "outboxId": "01M3C03V80N87VFZS5G0J0NFEX", "kind": "video", "path": s.path,
+		"key": s.key, "sha256": s.sha, "mime": "video/mp4", "caption": "رحلة", "durationS": 42, "width": 1280, "height": 720})
+	h.expect(protocol.EvSendResult)
+	vm := f.sent[0].msg.GetVideoMessage()
+	if vm.GetMimetype() != "video/mp4" || vm.GetSeconds() != 42 || vm.GetWidth() != 1280 || vm.GetHeight() != 720 || vm.GetCaption() != "رحلة" ||
+		vm.GetFileLength() != 64 {
+		t.Fatalf("video %v", vm)
+	}
+	h.advance(time.Second)
+	big := sealForTest(t, h.mediaDir, append(video, 0))
+	id := h.cmd("send_media", map[string]any{"chatJid": alice, "outboxId": "01M3C03V80N87VFZS5G0J0NFEY", "kind": "video", "path": big.path,
+		"key": big.key, "sha256": big.sha, "mime": "video/mp4"})
+	h.expectError(id, protocol.ErrMediaTooLarge)
+	notVideo := sealForTest(t, h.mediaDir, video)
+	id = h.cmd("send_media", map[string]any{"chatJid": alice, "outboxId": "01M3C03V80N87VFZS5G0J0NFEZ", "kind": "video", "path": notVideo.path,
+		"key": notVideo.key, "sha256": notVideo.sha, "mime": "image/jpeg"})
+	h.expectError(id, protocol.ErrMediaInvalid)
+	doc := sealForTest(t, h.mediaDir, bytes.Repeat([]byte("d"), 33))
+	id = h.cmd("send_media", map[string]any{"chatJid": alice, "outboxId": "01M3C03V80N87VFZS5G0J0NFF0", "kind": "file", "path": doc.path,
+		"key": doc.key, "sha256": doc.sha, "mime": "application/pdf"})
+	h.expectError(id, protocol.ErrMediaTooLarge)
+	if len(f.sent) != 1 {
+		t.Fatalf("sent %d", len(f.sent))
+	}
+}
+
+// Without the new limits a file keeps the first release's 32 MiB cap.
+func TestFileCapDefault(t *testing.T) {
+	h := newHarness(t, pairedFake)
+	h.initPairedConnected()
+	h.b.mu.Lock()
+	lim := h.b.lim
+	h.b.mu.Unlock()
+	if lim.FileMaxBytes != 32<<20 || lim.VideoMaxBytes != 16<<20 {
+		t.Fatalf("limits %+v", lim)
+	}
 }

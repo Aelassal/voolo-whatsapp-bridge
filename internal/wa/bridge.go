@@ -364,7 +364,8 @@ func (b *Bridge) doInit(id string, c *protocol.Init) {
 	b.init.StoreKey = "" // the key stays only in the open store's connection hook
 	b.sends = b.clampSends(recent, b.cfg.Now())
 	b.caps = &history.Caps{Days: c.Limits.HistoryDays, MaxPerChat: c.Limits.HistoryMaxPerChat, Now: b.cfg.Now}
-	b.lim = media.Limits{ImageMaxBytes: c.Limits.ImageMaxBytes, VoiceMaxSeconds: c.Limits.VoiceMaxSeconds, VoiceMaxBytes: c.Limits.VoiceBytes(), FileMaxBytes: protocol.MaxFileBytes}
+	b.lim = media.Limits{ImageMaxBytes: c.Limits.ImageMaxBytes, VoiceMaxSeconds: c.Limits.VoiceMaxSeconds, VoiceMaxBytes: c.Limits.VoiceBytes(),
+		FileMaxBytes: c.Limits.FileBytes(), VideoMaxBytes: c.Limits.VideoBytes()}
 	b.mu.Unlock()
 	if n := media.CleanStale(c.MediaDir, b.cfg.Now()); n > 0 {
 		b.cfg.Log.Info("media_stale_deleted", logx.N(int64(n)))

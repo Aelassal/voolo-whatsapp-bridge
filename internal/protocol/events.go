@@ -47,11 +47,12 @@ type Hello struct {
 const (
 	FeatureReplyContext = "reply_context"
 	FeatureForward      = "forward"
+	FeatureSendVideo    = "send_video"
 )
 
 // Features returns the features this bridge offers.
 func Features() []string {
-	return []string{FeatureReplyContext, FeatureForward}
+	return []string{FeatureReplyContext, FeatureForward, FeatureSendVideo}
 }
 
 // Account is ready.account.

@@ -12,6 +12,7 @@ import (
 	_ "image/jpeg" // image sizes for send_media
 	_ "image/png"
 	"mime"
+	"strings"
 	"sync"
 	"time"
 
@@ -269,6 +270,13 @@ func (b *Bridge) sendMedia(id string, c *protocol.SendMedia) {
 		mt = whatsmeow.MediaImage
 	case "voice":
 		mt = whatsmeow.MediaAudio
+	case "video":
+		mt = whatsmeow.MediaVideo
+		if !strings.HasPrefix(c.Mime, "video/") {
+			release()
+			b.fail(id, protocol.ErrMediaInvalid)
+			return
+		}
 	default:
 		mt = whatsmeow.MediaDocument
 	}
@@ -316,6 +324,19 @@ func (b *Bridge) sendMedia(id string, c *protocol.SendMedia) {
 			im.Width, im.Height = proto.Uint32(uint32(cfg.Width)), proto.Uint32(uint32(cfg.Height))
 		}
 		msg.ImageMessage = im
+	case "video":
+		vm := &waE2E.VideoMessage{Mimetype: proto.String(c.Mime), URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath),
+			MediaKey: up.MediaKey, FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength), ContextInfo: ci}
+		if c.Caption != "" {
+			vm.Caption = proto.String(c.Caption)
+		}
+		if c.DurationS > 0 {
+			vm.Seconds = proto.Uint32(uint32(c.DurationS))
+		}
+		if c.Width > 0 && c.Height > 0 {
+			vm.Width, vm.Height = proto.Uint32(uint32(c.Width)), proto.Uint32(uint32(c.Height))
+		}
+		msg.VideoMessage = vm
 	case "voice":
 		msg.AudioMessage = &waE2E.AudioMessage{Mimetype: proto.String(c.Mime), URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath),
 			MediaKey: up.MediaKey, FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),

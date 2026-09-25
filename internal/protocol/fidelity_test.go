@@ -71,3 +71,56 @@ func TestForwardFlag(t *testing.T) {
 		t.Fatal("forward not announced")
 	}
 }
+
+// Revision 2, feature send_video: the video kind, its display facts, and the
+// two new optional limits with their ceilings.
+func TestVideoKindAndLimits(t *testing.T) {
+	media := func(kind, extra string) string {
+		return `{"chatJid":"15550100002@s.whatsapp.net","outboxId":"01M3C03V80N87VFZS5G0J0NFEX","kind":"` + kind + `","path":"/tmp/m/0a.bin","key":"` +
+			strings.Repeat("1f", 32) + `","sha256":"` + strings.Repeat("aa", 32) + `","mime":"video/mp4"` + extra + `}`
+	}
+	cases := []struct {
+		payload string
+		ok      bool
+	}{
+		{media("video", ``), true},
+		{media("video", `,"durationS":42,"width":1280,"height":720,"caption":"رحلة"`), true},
+		{media("video", `,"durationS":-1`), false},
+		{media("video", `,"durationS":86401`), false},
+		{media("video", `,"width":16385,"height":10`), false},
+		{media("image", `,"durationS":4`), false}, // facts only for a video
+		{media("file", `,"width":4`), false},
+		{media("gif", ``), false},
+	}
+	for _, c := range cases {
+		if err := cmd(CmdSendMedia, c.payload); (err == nil) != c.ok {
+			t.Errorf("%s: err=%v, want ok=%v", c.payload, err, c.ok)
+		}
+	}
+	lim := func(extra string) string {
+		return `{"storeKey":"` + strings.Repeat("ab", 32) + `","storeDir":"/tmp/s","mediaDir":"/tmp/m","deviceName":"Voolo","limits":{"historyDays":1,"historyMaxPerChat":1,"imageMaxBytes":1,"voiceMaxSeconds":1` + extra + `}}`
+	}
+	for extra, ok := range map[string]bool{
+		``:                                    true,
+		`,"videoMaxBytes":67108864`:           true,
+		`,"videoMaxBytes":67108865`:           false,
+		`,"fileMaxBytes":104857600`:           true,
+		`,"fileMaxBytes":104857601`:           false,
+		`,"fileMaxBytes":0`:                   false,
+		`,"videoMaxBytes":1,"fileMaxBytes":1`: true,
+	} {
+		v, err := DecodeCommand(CmdInit, []byte(lim(extra)))
+		if (err == nil) != ok {
+			t.Errorf("limits %s: err=%v, want ok=%v", extra, err, ok)
+		}
+		if err == nil && extra == `` {
+			l := v.(*Init).Limits
+			if l.VideoBytes() != DefaultVideoMaxBytes || l.FileBytes() != DefaultFileMaxBytes {
+				t.Errorf("defaults %d %d", l.VideoBytes(), l.FileBytes())
+			}
+		}
+	}
+	if !slices.Contains(Features(), FeatureSendVideo) {
+		t.Fatal("send_video not announced")
+	}
+}
