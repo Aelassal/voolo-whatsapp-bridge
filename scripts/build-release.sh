@@ -4,6 +4,8 @@
 #
 # Builds the four release binaries reproducibly and writes SHA256SUMS.
 #   scripts/build-release.sh <version without v> <output dir>
+# Asset names are exactly voolo-whatsapp-bridge-<goos>-<goarch>, plus .exe on
+# Windows (PROTOCOL.md §13); clients look them up by these names.
 # Same inputs (source tree, Go version) give the same bytes: no cgo, -trimpath,
 # no VCS stamping, an empty build id, stripped symbols.
 set -euo pipefail
@@ -22,10 +24,10 @@ for target in windows/amd64 darwin/arm64 darwin/amd64 linux/amd64; do
   goarch="${target#*/}"
   ext=""
   [ "$goos" = windows ] && ext=".exe"
-  name="voolo-whatsapp-bridge_${version}_${goos}_${goarch}${ext}"
+  name="voolo-whatsapp-bridge-${goos}-${goarch}${ext}"
   GOOS="$goos" GOARCH="$goarch" go build -trimpath -buildvcs=false \
     -ldflags "-s -w -buildid= -X main.version=${version}" \
     -o "$out/$name" ./cmd/voolo-whatsapp-bridge
 done
-(cd "$out" && sha256sum voolo-whatsapp-bridge_* > SHA256SUMS)
+(cd "$out" && sha256sum voolo-whatsapp-bridge-* > SHA256SUMS)
 cat "$out/SHA256SUMS"

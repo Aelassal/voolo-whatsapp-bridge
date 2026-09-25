@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/logx"
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/protocol"
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/store"
+	"github.com/Aelassal/voolo-whatsapp-bridge/internal/transport"
 )
 
 // fakeClient stands in for whatsmeow. It never touches the network.
@@ -41,6 +43,7 @@ type fakeClient struct {
 	sendErr   error
 	sendGate  chan struct{} // when set, SendMessage waits for it
 	sendCalls int
+	sendPanic string // when set, SendMessage panics with it
 
 	marked  []markCall
 	markErr error
@@ -48,8 +51,13 @@ type fakeClient struct {
 	downloads map[string][]byte // direct path → plaintext
 	dlErr     error
 	dlCalls   int
+	dlLimits  []int64 // transport body limit carried by each download context (-1: none)
 
-	uploads int
+	uploads   int
+	uploadErr error
+
+	parses    int
+	parseHook func(n int) // called for every ParseWebMessage, with its 1-based count
 
 	pnForLID map[string]types.JID
 	contacts map[string]types.ContactInfo
@@ -132,8 +140,11 @@ func (f *fakeClient) PairPhone(ctx context.Context, phone string, _ bool, _ what
 func (f *fakeClient) SendMessage(ctx context.Context, to types.JID, m *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
 	f.mu.Lock()
 	f.sendCalls++
-	gate, err := f.sendGate, f.sendErr
+	gate, err, pv := f.sendGate, f.sendErr, f.sendPanic
 	f.mu.Unlock()
+	if pv != "" {
+		panic(pv)
+	}
 	if gate != nil {
 		select {
 		case <-gate:
@@ -161,6 +172,11 @@ func (f *fakeClient) DownloadMediaWithPath(ctx context.Context, path string, _, 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dlCalls++
+	lim, ok := transport.BodyLimit(ctx)
+	if !ok {
+		lim = -1
+	}
+	f.dlLimits = append(f.dlLimits, lim)
 	if f.dlErr != nil {
 		return nil, f.dlErr
 	}
@@ -170,7 +186,11 @@ func (f *fakeClient) DownloadMediaWithPath(ctx context.Context, path string, _, 
 func (f *fakeClient) Upload(ctx context.Context, data []byte, _ whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
 	f.mu.Lock()
 	f.uploads++
+	err := f.uploadErr
 	f.mu.Unlock()
+	if err != nil {
+		return whatsmeow.UploadResponse{}, err
+	}
 	return whatsmeow.UploadResponse{URL: "https://mmg.whatsapp.net/x", DirectPath: "/v/x", MediaKey: []byte{1}, FileLength: uint64(len(data))}, nil
 }
 
@@ -187,6 +207,13 @@ func (f *fakeClient) Logout(ctx context.Context) error {
 }
 
 func (f *fakeClient) ParseWebMessage(chat types.JID, w *waWeb.WebMessageInfo) (*events.Message, error) {
+	f.mu.Lock()
+	f.parses++
+	n, hook := f.parses, f.parseHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook(n)
+	}
 	info := types.MessageInfo{
 		MessageSource: types.MessageSource{Chat: chat, IsFromMe: w.GetKey().GetFromMe(), IsGroup: chat.Server == types.GroupServer},
 		ID:            w.GetKey().GetID(), PushName: w.GetPushName(), Timestamp: time.Unix(int64(w.GetMessageTimestamp()), 0),
@@ -253,7 +280,9 @@ const (
 	bob      = "15550100003@s.whatsapp.net"
 	group    = "120363000000000001@g.us"
 	aliceLID = "100000000000002@lid"
-	testKey  = "0000000000000000000000000000000000000000000000000000000000000001"
+	// A key with letters and digits, so a leak through the digit rule of the
+	// stderr scrubber alone would not hide it (review L1).
+	testKey = "9f3ab7c2e81d4f06a5b9c3d7e2f14a8b6c0d9e3f7a2b5c8d1e4f7a0b3c6d9e2f"
 )
 
 type harness struct {
@@ -267,11 +296,16 @@ type harness struct {
 	mediaDir string
 	fakes    []*fakeClient
 	mkFake   func() *fakeClient
-	now      time.Time
+	now      time.Time // base time; Now() returns now plus the advanced offset
+	offset   atomic.Int64
 	ids      *protocol.IDSource
 	refresh  int
+	opens    int // OpenStore calls
 	mu       sync.Mutex
 }
+
+// advance moves the bridge's clock forward (the send backstop uses it).
+func (h *harness) advance(d time.Duration) { h.offset.Add(int64(d)) }
 
 type lockedBuf struct {
 	mu sync.Mutex
@@ -315,8 +349,11 @@ func newHarness(t *testing.T, mk func() *fakeClient) *harness {
 	cfg := Config{
 		Out: protocol.NewWriter(pw, nil),
 		Log: logx.New(h.stderr, nil),
-		Now: func() time.Time { return h.now },
+		Now: func() time.Time { return h.now.Add(time.Duration(h.offset.Load())) },
 		OpenStore: func(ctx context.Context, d string, key []byte) (*store.Store, error) {
+			h.mu.Lock()
+			h.opens++
+			h.mu.Unlock()
 			return store.Open(ctx, d, key, logx.NewWA(logx.New(h.stderr, nil), "Database"))
 		},
 		NewClient: func(st *store.Store) (Client, error) {
@@ -459,6 +496,10 @@ func (h *harness) initPairedConnected() *fakeClient {
 	h.init(nil)
 	f := h.fake()
 	h.expectState(protocol.StateConnecting)
+	// Wait for the bridge's own Connect before reporting "connected": a
+	// Connected event that overtakes it would leave the fake disconnected
+	// (review L13, the TestMarkRead flake).
+	waitFor(h.t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.connects > 0 })
 	f.dispatch(&events.Connected{})
 	h.expectState(protocol.StateConnected)
 	return f
@@ -471,6 +512,18 @@ func (h *harness) expectState(s string) {
 		if field[protocol.Status](e).State == s {
 			return
 		}
+	}
+}
+
+// waitFor polls cond until it holds, failing after 5 s.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in 5 s")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 

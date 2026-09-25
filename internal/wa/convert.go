@@ -19,6 +19,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/protocol"
+	"github.com/Aelassal/voolo-whatsapp-bridge/internal/transport"
 )
 
 // truncate cuts s to at most n characters, at a character boundary.
@@ -235,6 +236,8 @@ func LogoutReason(r events.ConnectFailureReason) string {
 }
 
 // SignalFor maps a provider event to a signal (§5.4); ok=false otherwise.
+// ClientOutdated is not mapped here: the bridge refreshes the version and
+// retries once, and signals client_outdated only if that fails (clientOutdated).
 func SignalFor(evt any) (protocol.Signal, bool) {
 	switch e := evt.(type) {
 	case *events.TemporaryBan:
@@ -245,8 +248,6 @@ func SignalFor(evt any) (protocol.Signal, bool) {
 		return s, true
 	case *events.StreamReplaced:
 		return protocol.Signal{Kind: protocol.SigStreamReplaced}, true
-	case *events.ClientOutdated:
-		return protocol.Signal{Kind: protocol.SigClientOutdated}, true
 	case *events.ConnectFailure:
 		if int(e.Reason) == 429 {
 			return protocol.Signal{Kind: protocol.SigRateLimited, Code: 429}, true
@@ -297,6 +298,8 @@ func serverErrorCode(err error) int {
 // DownloadErrorCode maps a media download error.
 func DownloadErrorCode(err error) string {
 	switch {
+	case errors.Is(err, transport.ErrBodyTooLarge):
+		return protocol.ErrMediaTooLarge
 	case errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404), errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410),
 		errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403), errors.Is(err, whatsmeow.ErrNoURLPresent):
 		return protocol.ErrMediaExpired

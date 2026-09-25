@@ -23,6 +23,7 @@ import (
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/logx"
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/media"
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/protocol"
+	"github.com/Aelassal/voolo-whatsapp-bridge/internal/transport"
 )
 
 // ready checks the common preconditions of commands that talk to WhatsApp.
@@ -43,10 +44,47 @@ func (b *Bridge) ready(id string) (*session, bool) {
 	return s, true
 }
 
+// The send backstop (PROTOCOL.md §6.5, review M6): compiled in, not
+// configurable by the client, and above Voolo's own caps.
+const (
+	MinSendInterval  = time.Second      // at least this long between two sends
+	MaxSendsInWindow = 30               // at most this many sends ...
+	SendWindow       = 10 * time.Minute // ... in any window this long
+)
+
+// backstopAllows reports whether a send may start now. The caller holds the
+// single send slot, so nothing else changes b.sends meanwhile.
+func (b *Bridge) backstopAllows(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	keep := b.sends[:0]
+	for _, t := range b.sends {
+		if now.Sub(t) < SendWindow {
+			keep = append(keep, t)
+		}
+	}
+	b.sends = keep
+	if len(keep) >= MaxSendsInWindow {
+		return false
+	}
+	if n := len(keep); n > 0 && now.Sub(keep[n-1]) < MinSendInterval {
+		return false
+	}
+	return true
+}
+
+func (b *Bridge) recordSend(t time.Time) {
+	b.mu.Lock()
+	b.sends = append(b.sends, t)
+	b.mu.Unlock()
+}
+
 // beginSend runs the checks every send shares, in the order of PROTOCOL.md
-// §6.5, and reserves the outbox id. On success it returns release, which frees
-// the single send slot; it must run before the final reply is written, so a
-// client that sends again right after send_result is not told busy.
+// §6.5 (not_paired, not_connected, busy, unknown_chat, duplicate_outbox_id,
+// rate_limited_local), and reserves the outbox id. On success it returns
+// release, which frees the single send slot; it must run before the final
+// reply is written, so a client that sends again right after send_result is
+// not told busy. A refusal leaves the outbox id unused.
 func (b *Bridge) beginSend(id, chatJID, outboxID string) (s *session, to types.JID, release func(), ok bool) {
 	s, ok = b.ready(id)
 	if !ok {
@@ -57,26 +95,47 @@ func (b *Bridge) beginSend(id, chatJID, outboxID string) (s *session, to types.J
 		return nil, types.EmptyJID, nil, false
 	}
 	var once sync.Once
-	release = func() { once.Do(func() { b.sending.Store(false) }) }
+	free := func() { once.Do(func() { b.sending.Store(false) }) }
+	defer func() {
+		// A panic below frees the slot too.
+		if !ok {
+			free()
+		}
+	}()
+	ok = false
+	// A refusal frees the slot before its error is written (§6.5).
+	refuse := func(code string) (*session, types.JID, func(), bool) {
+		free()
+		b.fail(id, code)
+		if code == protocol.ErrDuplicateOutboxID || code == protocol.ErrRateLimitedLocal {
+			b.cfg.Log.Warn("send_refused", logx.Code(code))
+		}
+		return nil, types.EmptyJID, nil, false
+	}
 	to, err := types.ParseJID(chatJID)
 	if err != nil || !b.knownChat(chatJID) {
-		release()
-		b.fail(id, protocol.ErrUnknownChat)
-		return nil, types.EmptyJID, nil, false
+		return refuse(protocol.ErrUnknownChat)
 	}
-	dup, err := s.st.ReserveOutbox(s.ctx, outboxID, b.cfg.Now())
+	known, err := s.st.OutboxKnown(s.ctx, outboxID)
 	if err != nil {
-		release()
-		b.fail(id, protocol.ErrStoreIO)
-		return nil, types.EmptyJID, nil, false
+		return refuse(protocol.ErrStoreIO)
+	}
+	if known {
+		return refuse(protocol.ErrDuplicateOutboxID)
+	}
+	now := b.cfg.Now()
+	if !b.backstopAllows(now) {
+		return refuse(protocol.ErrRateLimitedLocal)
+	}
+	dup, err := s.st.ReserveOutbox(s.ctx, outboxID, now)
+	if err != nil {
+		return refuse(protocol.ErrStoreIO)
 	}
 	if dup {
-		release()
-		b.fail(id, protocol.ErrDuplicateOutboxID)
-		b.cfg.Log.Warn("send_refused", logx.Code(protocol.ErrDuplicateOutboxID))
-		return nil, types.EmptyJID, nil, false
+		return refuse(protocol.ErrDuplicateOutboxID)
 	}
-	return s, to, release, true
+	b.recordSend(now)
+	return s, to, free, true
 }
 
 // deliver sends one message, once. It is never retried by the bridge.
@@ -136,6 +195,9 @@ func (b *Bridge) sendMedia(id string, c *protocol.SendMedia) {
 	b.mu.Lock()
 	lim, dir := b.lim, b.init.MediaDir
 	b.mu.Unlock()
+	// The hand-off file is deleted in every case, also when the send is
+	// refused before the file is read (§6.6, review L4).
+	defer media.Discard(dir, c.Path)
 	s, to, release, ok := b.beginSend(id, c.ChatJID, c.OutboxID)
 	if !ok {
 		return
@@ -162,7 +224,14 @@ func (b *Bridge) sendMedia(id string, c *protocol.SendMedia) {
 	}
 	secs := 0
 	if c.Kind == "voice" {
+		// A voice note is Ogg Opus with a duration read from the file; anything
+		// else could not be held to voiceMaxSeconds (review L10).
 		secs = media.OggDurationSeconds(data)
+		if !media.VoiceMime(c.Mime) || secs <= 0 {
+			release()
+			b.fail(id, protocol.ErrMediaInvalid)
+			return
+		}
 		if secs > lim.VoiceMaxSeconds {
 			release()
 			b.fail(id, protocol.ErrMediaTooLarge)
@@ -230,6 +299,21 @@ func (b *Bridge) markRead(id string, c *protocol.MarkRead) {
 		b.fail(id, protocol.ErrBadRequest)
 		return
 	}
+	// Read receipts only for chats the bridge reported (review L3) ...
+	if !b.knownChat(c.ChatJID) {
+		b.fail(id, protocol.ErrUnknownChat)
+		return
+	}
+	// ... and, in a group, only for messages of the named sender where the
+	// bridge knows who wrote them.
+	if c.SenderJID != "" {
+		for _, mid := range c.MessageIDs {
+			if by, known := b.senders.get(c.ChatJID + "|" + mid); known && by != c.SenderJID {
+				b.fail(id, protocol.ErrBadRequest)
+				return
+			}
+		}
+	}
 	sender := types.EmptyJID
 	if c.SenderJID != "" {
 		sender, _ = types.ParseJID(c.SenderJID)
@@ -282,7 +366,13 @@ func (b *Bridge) fetchMedia(id string, c *protocol.FetchMedia) {
 	if d.Kind == "voice" {
 		mt = whatsmeow.MediaAudio
 	}
-	ctx, cancel := context.WithTimeout(s.ctx, b.cfg.FetchTimeout)
+	// The transport cuts the download off past the cap (plus WhatsApp's
+	// encryption overhead), whatever size the sender declared (review M2).
+	maxBytes := lim.ImageMaxBytes
+	if d.Kind == "voice" {
+		maxBytes = lim.VoiceMaxBytes
+	}
+	ctx, cancel := context.WithTimeout(transport.WithBodyLimit(s.ctx, maxBytes+media.DownloadOverhead), b.cfg.FetchTimeout)
 	data, err := s.cli.DownloadMediaWithPath(ctx, d.DirectPath, d.FileEncSHA256, d.FileSHA256, d.MediaKey, mt, "", false)
 	cancel()
 	if err != nil {
@@ -291,7 +381,15 @@ func (b *Bridge) fetchMedia(id string, c *protocol.FetchMedia) {
 		b.cfg.Log.Warn("fetch_failed", logx.Code(code))
 		return
 	}
-	if media.CheckFetch(d.Kind, int64(len(data)), d.DurationS, lim) != nil {
+	durationS := d.DurationS
+	if d.Kind == "voice" {
+		// The duration of the file itself where it can be read (review L10).
+		if secs := media.OggDurationSeconds(data); secs > 0 {
+			durationS = secs
+		}
+	}
+	if media.CheckFetch(d.Kind, int64(len(data)), durationS, lim) != nil {
+		clear(data)
 		b.fail(id, protocol.ErrMediaTooLarge)
 		return
 	}
@@ -302,7 +400,7 @@ func (b *Bridge) fetchMedia(id string, c *protocol.FetchMedia) {
 		return
 	}
 	b.emit(protocol.EvMediaReady, protocol.MediaReady{ReplyTo: id, MessageID: c.MessageID, Path: sealed.Path, Key: sealed.Key,
-		SHA256: sealed.SHA256, Mime: d.Mime, SizeBytes: sealed.SizeBytes, DurationS: d.DurationS})
+		SHA256: sealed.SHA256, Mime: d.Mime, SizeBytes: sealed.SizeBytes, DurationS: durationS})
 }
 
 func (b *Bridge) logout(id string) {
@@ -326,8 +424,8 @@ func (b *Bridge) logout(id string) {
 		b.fail(id, code)
 		return
 	}
-	b.resetAfterLogout(s, protocol.LogoutUser, 0)
-	b.emit(protocol.EvOK, protocol.Reply{ReplyTo: id})
+	// Stop, which the caller runs next, deletes the store and replies ok.
+	b.loggedOutBy(s, protocol.LogoutUser, 0, id)
 }
 
 // lru is a small bounded map (message → sender, for quoted replies).

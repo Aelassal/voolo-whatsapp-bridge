@@ -84,7 +84,6 @@ func TestSignalMapping(t *testing.T) {
 	}{
 		{&events.TemporaryBan{Code: 104, Expire: 2 * time.Hour}, "temp_banned", 104},
 		{&events.StreamReplaced{}, "stream_replaced", nil},
-		{&events.ClientOutdated{}, "client_outdated", nil},
 		{&events.ConnectFailure{Reason: 500}, "connect_failure", 500},
 		{&events.ConnectFailure{Reason: 503}, "connect_failure", 503},
 		{&events.ConnectFailure{Reason: 429}, "rate_limited", 429},
@@ -97,7 +96,9 @@ func TestSignalMapping(t *testing.T) {
 			t.Errorf("%T: %+v", c.evt, s)
 		}
 	}
-	for _, e := range []any{&events.Connected{}, &events.Message{}, &events.LoggedOut{}} {
+	// ClientOutdated is signalled only after the bridge's own retry failed
+	// (TestClientOutdatedRefreshOnceThenFatal), never straight from the event.
+	for _, e := range []any{&events.Connected{}, &events.Message{}, &events.LoggedOut{}, &events.ClientOutdated{}} {
 		if _, ok := SignalFor(e); ok {
 			t.Errorf("%T is not a signal", e)
 		}
@@ -198,8 +199,16 @@ func TestRealClientUsesGuardedTransport(t *testing.T) {
 		return nil, errors.New("test: no network")
 	}
 	var blocked int
-	hc := transport.NewClient(transport.Options{Dial: fakeDial, OnBlock: func() { blocked++ }})
-	cli := NewRealClient(dev, hc, nil).(realClient)
+	var looked []string
+	// A fake resolver too: nothing, not even a DNS query, leaves the process.
+	lookup := func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		mu.Lock()
+		looked = append(looked, host)
+		mu.Unlock()
+		return []net.IPAddr{{IP: net.ParseIP("157.240.1.1")}}, nil
+	}
+	opts := transport.Options{Dial: fakeDial, Lookup: lookup, OnBlock: func() { blocked++ }}
+	cli := NewRealClient(dev, transport.NewClient(opts), transport.NewMediaClient(opts), nil).(realClient)
 	cli.EnableAutoReconnect = false
 	cli.InitialAutoReconnect = false
 	if err := cli.Connect(); err == nil {
@@ -207,8 +216,8 @@ func TestRealClientUsesGuardedTransport(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(dialed) == 0 || dialed[0] != "web.whatsapp.com:443" {
-		t.Fatalf("dialed %v", dialed)
+	if len(looked) == 0 || looked[0] != "web.whatsapp.com" || len(dialed) == 0 || dialed[0] != "157.240.1.1:443" {
+		t.Fatalf("resolved %v, dialed %v", looked, dialed)
 	}
 	if blocked != 0 {
 		t.Fatal("web.whatsapp.com was blocked")

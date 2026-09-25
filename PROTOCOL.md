@@ -16,6 +16,7 @@ This document is the complete interface of `voolo-whatsapp-bridge`. A client nee
 - **Protocol version:** 1 (the `v` field of every message and `hello.protocol`).
 - **Status:** v1 as published with the first release. Fields may be **added** within v1. Removing or changing a field, or a new command whose absence would break a client, means v2.
 - **Changes before the first release** (2026-09-25, from building the bridge, task P1-A): media caps raised by the owner (§6.1, §8); optional `limits.voiceMaxBytes` (§6.1) and `send_media.fileName` (§6.6); clarifications of existing rules in §2, §5.3, §5.4, §5.10, §5.12, §5.15, §6.2–§6.9, §9, §10 and the flags key in §11. Each clarified rule is marked *(clarified)*.
+- **Changes from the P1-A security review** (2026-09-25, before the first release; marked *(review)*): a logout ends the process and the store is never reopened with the same key (§5.9, §6.4); exit codes 6 and 7, and 2 is left to the Go runtime (§4, §9); a compiled-in send backstop with the new error `rate_limited_local` (§6.5, §9); `client_outdated` is signalled only after the bridge's own refresh and retry fail (§5.4); stricter input (invalid UTF-8, ULID range; §2), `mark_read` only for reported chats (§6.7), voice notes read from the file (§6.6, §6.8, §8), bounded media downloads (§6.8, §8), the stderr event list (§10.4), release file names and versions (§13), and corrections of three statements about WhatsApp's behaviour (§5.4, §6.2, §10.3). Known limits are in §14.
 - Words in capitals (MUST, MUST NOT, SHOULD) have their usual meaning.
 
 ## 1. Transport
@@ -39,21 +40,21 @@ Every line in both directions is an object with exactly these five fields:
 | Field | Type | Rules |
 |---|---|---|
 | `v` | integer | `1`. A different value means the peer speaks another protocol: the client SHOULD stop the bridge; the bridge answers `error {code: unsupported_version}` and ignores the line. |
-| `id` | string | A ULID: 26 characters of Crockford base32 (`0-9 A-Z` without `I L O U`), unique per sender. |
+| `id` | string | A ULID: 26 characters of Crockford base32 (`0-9 A-Z` without `I L O U`), unique per sender. *(review)* The first character is `0`–`7` (a ULID is 128 bits); a larger one is not a ULID. |
 | `type` | string | `^[a-z][a-z0-9_]{0,63}$`. Commands and events are listed in §5–§7. |
 | `ts` | integer | Sender's clock, Unix milliseconds UTC. |
 | `payload` | object | Per type. `{}` when empty. |
 
 **Replies.** A reply to a command carries `payload.replyTo` = the command's `id`. Every command gets exactly one final reply (`ok`, a typed result, or `error`), except `ack`, which gets none. Events that are not replies have no `replyTo`.
 
-**Strictness.** The bridge decodes **commands strictly**: an unknown field anywhere in a command's payload, a wrong type or a value out of range gets `error {code: bad_request}` and the command is not executed. *(clarified)* Member names are matched exactly, including case (`chatjid` is an unknown field, not `chatJid`); a duplicated member name, a `null` value for any field, and a number written with a fraction or exponent where an integer is expected are all `bad_request`. The order of checks is: envelope, `v`, known `type` (`unknown_command`), `init` order (`not_initialized`), payload (`bad_request`). Clients SHOULD decode **events leniently**: ignore fields they do not know, so that a newer bridge can add fields within v1. A client ignores an event `type` it does not know; the bridge answers a command `type` it does not know with `error {code: unknown_command}` and does nothing else. A line that is not valid JSON, or not an object with exactly the five envelope fields, is dropped and counted.
+**Strictness.** The bridge decodes **commands strictly**: an unknown field anywhere in a command's payload, a wrong type or a value out of range gets `error {code: bad_request}` and the command is not executed. *(clarified)* Member names are matched exactly, including case (`chatjid` is an unknown field, not `chatJid`); a duplicated member name, a `null` value for any field, and a number written with a fraction or exponent where an integer is expected are all `bad_request`. The order of checks is: envelope, `v`, known `type` (`unknown_command`), `init` order (`not_initialized`), payload (`bad_request`). Clients SHOULD decode **events leniently**: ignore fields they do not know, so that a newer bridge can add fields within v1. A client ignores an event `type` it does not know; the bridge answers a command `type` it does not know with `error {code: unknown_command}` and does nothing else. A line that is not valid JSON, or not an object with exactly the five envelope fields, is dropped and counted. *(review)* A command payload that is not valid UTF-8, or that holds a `\uXXXX` escape of a lone UTF-16 surrogate, is `bad_request`: the bridge never replaces such text with U+FFFD and sends it.
 
 ## 3. Identifiers and values
 
 - **Chat JID:** WhatsApp's address of a chat, without a device part. `<digits>@s.whatsapp.net` (a person, by phone number), `<digits>@lid` (a person, by WhatsApp's linked id, when no phone number is known), `<digits>-<digits>@g.us` or `<digits>@g.us` (a group). Max 128 characters. Broadcast lists, `status@broadcast` and newsletters are never reported.
 - **Sender JID:** a person's JID as above. In a group it names the author, and for your own messages it is your own JID.
 - **Message id:** WhatsApp's message id, a string of 1–128 characters from `[A-Za-z0-9._-]`. A message is identified by `(chatJid, messageId)`.
-- **Phone number** (in `pair_phone`): digits only, 7–15 of them, international format without `+` or a leading `0` (for example `201001234567`).
+- **Phone number** (in `pair_phone`): digits only, 7–15 of them, international format without `+` or a leading `0` (for example `15550100001`, a fictitious number: never try a real stranger's number, the phone behind it would be asked to link).
 - **Times** are Unix milliseconds UTC. **Durations** are in milliseconds unless the name ends in `S` (seconds).
 - **Text** is UTF-8, max 65,536 characters. Names and titles are max 512 characters. Longer values are truncated by the bridge at a character boundary.
 
@@ -75,7 +76,7 @@ client                                   bridge
 ```
 
 - The bridge accepts **no command before `init`** except `ping` and `shutdown`. Anything else gets `error {code: not_initialized}`.
-- If `init` has not arrived within **10 s** of `hello`, the bridge exits with code 2.
+- If `init` has not arrived within **10 s** of `hello`, the bridge exits with code 6. *(review: was 2, which is the Go runtime's own crash code; §9.)*
 - A second `init` gets `error {code: already_initialized}`.
 
 ## 5. Events (bridge → client)
@@ -85,6 +86,7 @@ Examples of every event are in `examples/bridge-to-app/`. Optional fields are ma
 ### 5.1 `hello`
 First line the bridge writes.
 `{bridge: "voolo-whatsapp-bridge", version: "<semver>", protocol: 1, os: "windows|darwin|linux", arch: "amd64|arm64"}`
+*(review)* `version` is `MAJOR.MINOR.PATCH` without a leading `v` (a development build says `0.0.0-dev`). Versions are compared as three numbers, never with a `v` and never as strings, for example against `flags.json` `maxBridgeVersion` (§11) and release tags (§13).
 
 ### 5.2 `ready` (reply to `init`)
 `{replyTo, paired: bool, account?: {jid, pushName?}}`. When `paired` is true, the bridge starts connecting immediately.
@@ -96,7 +98,7 @@ The connection state, sent on every change.
 - `connecting`: first connection after start or pairing.
 - `connected`: online and receiving.
 - `reconnecting`: the connection dropped. The bridge retries by itself.
-- `stopped`: the bridge will not reconnect (after `logged_out`, or before exiting). *(clarified)* Also after `signal {temp_banned}`, `signal {stream_replaced}` and `signal {connect_failure}`: WhatsApp closed the connection and the bridge does not dial again by itself. The client decides (restart the bridge later, or not).
+- `stopped`: the bridge will not reconnect (after `logged_out`, or before exiting). *(review)* After `logged_out` the bridge always exits (code 7, §6.4); it never goes back to `unpaired` in the same process. *(clarified)* Also after `signal {temp_banned}`, `signal {stream_replaced}` and `signal {connect_failure}`: WhatsApp closed the connection and the bridge does not dial again by itself. The client decides (restart the bridge later, or not).
 
 ### 5.4 `signal`
 A provider event that suggests throttling, a ban, a forced update or a duplicate session. The bridge reports these and never acts on them beyond what §6 says. The client decides what to do.
@@ -104,8 +106,8 @@ A provider event that suggests throttling, a ban, a forced update or a duplicate
 - `rate_limited`: WhatsApp answered with a rate-limit error (for example 429). *(clarified)* `code` is `429`. It is sent together with the `error {code: rate_limited}` of a refused send, and for a connect failure with reason 429.
 - `temp_banned`: temporary ban. `code` is WhatsApp's reason code (101, 102, 103, 104, 106, …), and `expiresInMs` is present if WhatsApp gave one.
 - `stream_replaced`: another client connected with the same session. The bridge stops reconnecting.
-- `client_outdated`: WhatsApp rejected the client version (405). The bridge refreshes the WhatsApp Web version once and retries; a second rejection is reported again.
-- `connect_failure`: another connection failure, with `code` (for example 500, 503).
+- `client_outdated`: WhatsApp rejected the client version (405). *(review, lead decision 2026-09-25)* On the first 405 the bridge refreshes the WhatsApp Web version and reconnects once by itself, without a signal. Only if that retry is rejected again, or the refresh fails, it sends `signal {client_outdated}`, then `error {client_outdated, fatal: true}`, and exits with code 5. A pairing in progress is reopened by the retry, and ended with `pair_failed {client_outdated}` if it fails.
+- `connect_failure`: another connection failure that WhatsApp's library does not retry by itself, with `code`. *(review, corrected)* 500 and 503 are retried by the connection library without any event, so they are not reported here; the client sees `status {reconnecting}` at most. A 429 is reported as `rate_limited`.
 - `stream_error`: an unknown stream error, with `code` as a string.
 - `keepalive_timeout`: the server stopped answering keep-alives.
 
@@ -129,7 +131,7 @@ A provider event that suggests throttling, a ban, a forced update or a duplicate
 - `banned`: code 406 or any logout WhatsApp describes as a ban.
 - `unknown`: anything else.
 
-The bridge has already deleted the linked device from its store when it sends this event. `status` becomes `stopped`, then `unpaired`.
+The bridge has already deleted the linked device from its store when it sends this event. *(review)* It has in fact deleted the whole store file: the event follows the deletion. Then comes `status {stopped}` (and `ok` for a `logout` command), and the bridge exits with code 7. It never opens a new store in the same process (§6.4).
 
 ### 5.10 `sync_progress`
 `{kind: "history"|"offline", progress?, done}`. `history` tracks the history sync the phone sends after linking (`progress` 0–100 when the phone reports it). `offline` tracks the catch-up of messages that arrived while the bridge was not running. `done: true` is sent once per kind per connection. *(clarified)* The phone does not say when it has sent its last history part, so `{kind: history, done: true}` is sent after a part that reports `progress: 100` has been fully delivered, or after 60 s without a new history part, whichever comes first. It is only sent on a connection that received history.
@@ -230,13 +232,17 @@ There are **no** other commands. In particular there is no command to send to se
 Errors: `store_key_invalid` (the key does not open an existing store; fatal, exit 3), `store_locked` (another bridge holds the store; fatal, exit 4), `store_io`, `bad_request`.
 
 ### 6.2 `pair_qr`
-Starts QR linking. Fails with `already_paired` if the store already has an account. *(clarified)* Fails with `busy` while another `pair_qr` or `pair_phone` is running, and with `pair_failed` (retryable) if the linking socket could not be opened within 30 s.
+Starts QR linking. Fails with `already_paired` if the store already has an account. *(clarified)* Fails with `busy` while another `pair_qr` or `pair_phone` is running. *(review, corrected)* If the linking connection cannot be started at all, the reply is `error {pair_failed}` (retryable). If it starts but closes before a code arrives (for example no network), the pairing ends with `pair_failed {reason: timeout}`, usually within a second. If no code arrives within 30 s, the reply is `error {pair_failed}`. In every case the client may simply try again.
 
 ### 6.3 `pair_phone`
 `{phone}` (§3). Starts linking by code. Errors: `phone_invalid`, `already_paired`, `pair_failed`. *(clarified)* Also `busy`, as in §6.2. WhatsApp requires the name of a code-linked device to have the form `Browser (OS)`, so the phone's Linked devices list shows `Chrome (Windows)`, `Chrome (Mac OS)` or `Chrome (Linux)` for such a link (approved by the owner on 2026-09-25). No `qr` event is sent during a phone-number link; its window is the same as the QR window (§5.5).
 
 ### 6.4 `logout`
-Unlinks this device on WhatsApp's side, deletes it from the store and sends `logged_out {reason: user}`. The client then usually sends `shutdown` and deletes the store folder. *(clarified)* The bridge deletes the whole store file (`store.db` and its `-wal`/`-shm`), then opens a new, empty store with the same key, so it can be linked again without a restart. Events in order: `logged_out`, `status {stopped}`, `status {unpaired}`, then `ok`. Errors: `not_paired`; `not_connected` (retryable; nothing was unlinked); `timeout`. A remote logout (§5.9) deletes the store the same way.
+Unlinks this device on WhatsApp's side, deletes the store and exits. *(review, changed: the first draft reopened an empty store with the same key, so the old key stayed in use and in the keychain, and leftover copies of the old file stayed decryptable.)*
+- The bridge stops the session, waits for its own work to finish, deletes the whole store file (`store.db` and its `-wal`, `-shm`, `-journal`), then writes, in order: `logged_out {reason: user}`, `status {stopped}`, `ok`. It then exits with **code 7**.
+- A remote logout (§5.9) does the same, without the `ok`.
+- The bridge never opens a store again with the key it was given. To link again, the client deletes the old key from its keychain, generates a **new** key, and starts a new bridge with it (an empty store folder, or the same folder: the old file is gone). The client SHOULD also delete the store folder; if the deletion failed, the bridge writes `error {store_io}` without `replyTo` before `logged_out`, and a new key on the old file would get `store_key_invalid`.
+- Errors: `not_paired`; `not_connected` (retryable; nothing was unlinked); `timeout`; `internal`.
 
 ### 6.5 `send_text`
 `{chatJid, text, outboxId, quotedMessageId?}`
@@ -244,22 +250,26 @@ Unlinks this device on WhatsApp's side, deletes it from the store and sends `log
 - `outboxId`: a ULID chosen by the client, one per message the user asked to send.
 - Only **one** send (`send_text` or `send_media`) may be in flight. A second one gets `busy`.
 - The bridge remembers the last 1,000 `outboxId`s in the store, across restarts. A repeated one gets `duplicate_outbox_id` and nothing is sent.
-- The bridge never retries a send by itself. Errors: `not_paired`, `not_connected` (nothing was sent), `busy`, `duplicate_outbox_id`, `unknown_chat`, `rate_limited`, `send_failed`, `timeout`.
-- *(clarified)* Checks run in this order: `not_paired`, `not_connected`, `busy`, `unknown_chat`, `duplicate_outbox_id`. A command refused by one of them is not remembered, so the same `outboxId` can be used again. Once those checks pass, the `outboxId` is remembered **before** the message is handed to WhatsApp, whatever happens next: after `timeout`, `send_failed` or `rate_limited`, the same `outboxId` gets `duplicate_outbox_id`, and a retry is a new user action with a new `outboxId`.
+- The bridge never retries a send by itself. Errors: `not_paired`, `not_connected` (nothing was sent), `busy`, `duplicate_outbox_id`, `unknown_chat`, `rate_limited_local`, `rate_limited`, `send_failed`, `timeout`, `internal`.
+- *(clarified; review: `rate_limited_local` added)* Checks run in this order: `not_paired`, `not_connected`, `busy`, `unknown_chat`, `duplicate_outbox_id`, `rate_limited_local`. A command refused by one of them is not remembered, so the same `outboxId` can be used again.
+- *(review)* **Send backstop.** Compiled into the bridge, not configurable: at least **1 s** between two sends, and at most **30 sends in any 10 minutes** (`send_text` and `send_media` together, counted when the `outboxId` is reserved, also across restarts of the bridge). A send beyond it gets `error {rate_limited_local, retryable: true}`: nothing was sent, the `outboxId` is not used, and no `signal` is sent (WhatsApp said nothing). It sits above a client's own caps (Voolo's is 20 per 10 minutes) and is only a last defence against a loop or a script.
+- *(review)* **Transport-level resends.** "Never retried" means the bridge never sends a message again. Two things below it are not new messages: (1) if the connection drops while a send waits for WhatsApp's acknowledgement and comes back within about 5 s, the connection library writes the **same encrypted frame, with the same message id**, once more, and WhatsApp keeps one message; (2) when a recipient's device cannot decrypt a message it asks for it again (a retry receipt), and the library re-encrypts and resends **the same message id** to that device, as every WhatsApp client does. Neither creates a second message in the chat. Once those checks pass, the `outboxId` is remembered **before** the message is handed to WhatsApp, whatever happens next: after `timeout`, `send_failed` or `rate_limited`, the same `outboxId` gets `duplicate_outbox_id`, and a retry is a new user action with a new `outboxId`.
 - *(clarified)* `unknown_chat`: the bridge only sends to a chat it has reported (in this run or an earlier one, remembered in the store) or to a group the account belongs to. A phone number that never appeared is refused.
-- *(clarified)* The single send slot is freed before `send_result` or the send's `error` is written, so the next send may follow the reply immediately.
+- *(clarified)* The single send slot is freed before `send_result` or the send's `error` is written, so the next send may follow the reply immediately (subject to the backstop).
+- *(review)* A panic inside a send is answered with `error {internal}` and frees the slot.
 - *(clarified)* `quotedMessageId` refers to a message in the same chat. The bridge adds the quoted message's author when it has seen that message recently; it does not send a copy of the quoted content.
 
 ### 6.6 `send_media`
 `{chatJid, outboxId, kind: "image"|"voice"|"file", path, key, sha256, mime, caption?, fileName?}`. The client writes the file in the §8 format under `mediaDir` with its own fresh key. The bridge reads, decrypts and checks it, uploads it, deletes the file, and replies. Same rules and errors as §6.5, plus `media_too_large` and `media_invalid`.
-- *(clarified)* `path` must be `<mediaDir>/<32 lowercase hex>.bin`, a regular file (not a link). It is deleted once read, in every case. Caps: `image` ≤ `limits.imageMaxBytes`; `voice` ≤ `limits.voiceMaxBytes` and, for Ogg Opus, ≤ `limits.voiceMaxSeconds` (read from the file); `file` ≤ 33,554,432 bytes. `voice` is sent as a voice note (push-to-talk). `mime`: `type/subtype` with optional parameters, for example `audio/ogg; codecs=opus`.
+- *(clarified)* `path` must be `<mediaDir>/<32 lowercase hex>.bin`, a regular file (not a link). It is deleted once read, in every case. *(review)* Also when the command is refused before the file is read (`busy`, `unknown_chat`, `duplicate_outbox_id`, `not_connected`, …). The file is opened once and checked on the open handle, so a path swapped for a link after the check, or a file cut short, gets `media_invalid`. Caps: `image` ≤ `limits.imageMaxBytes`; `voice` ≤ `limits.voiceMaxBytes` and ≤ `limits.voiceMaxSeconds` (read from the file); `file` ≤ 33,554,432 bytes. *(review)* A `voice` must be Ogg Opus (`mime` `audio/ogg`, with or without parameters) whose duration the bridge can read; anything else is `media_invalid`. `voice` is sent as a voice note (push-to-talk). `mime`: `type/subtype` with optional parameters, for example `audio/ogg; codecs=opus`.
 - *(added within v1)* `fileName?`: 1–255 characters, no `/`, `\` or control characters; the name shown for `kind: file` (default `file` plus an extension from `mime`).
 
 ### 6.7 `mark_read`
-`{chatJid, messageIds: [id] (1–50), senderJid?}`. Sends read receipts for these received messages (`senderJid` is required in groups). WhatsApp applies the user's own read-receipt privacy setting. *(clarified)* In a group, all `messageIds` must be from that one `senderJid`; send one `mark_read` per sender. A group `mark_read` without `senderJid` is `bad_request`. Errors: `not_paired`, `not_connected`, `timeout`, `internal`.
+`{chatJid, messageIds: [id] (1–50), senderJid?}`. Sends read receipts for these received messages (`senderJid` is required in groups). WhatsApp applies the user's own read-receipt privacy setting. *(clarified)* In a group, all `messageIds` must be from that one `senderJid`; send one `mark_read` per sender. A group `mark_read` without `senderJid` is `bad_request`. *(review)* Only for a chat the bridge has reported (as for sends, §6.5), otherwise `unknown_chat`; and if the bridge knows that one of the `messageIds` was written by someone other than `senderJid`, `bad_request`. Errors: `not_paired`, `not_connected`, `unknown_chat`, `bad_request`, `timeout`, `internal`.
 
 ### 6.8 `fetch_media`
-`{chatJid, messageId}`. Downloads the media of a message the bridge has reported, subject to the limits of `init`. Errors: `unknown_message`, `media_too_large` (checked before download), `media_expired` (no longer on WhatsApp's servers), `media_unavailable`, `not_connected`, `timeout`.
+`{chatJid, messageId}`. Downloads the media of a message the bridge has reported, subject to the limits of `init`. Errors: `unknown_message`, `media_too_large` (checked before download, and again during and after it), `media_expired` (no longer on WhatsApp's servers), `media_unavailable`, `not_connected`, `timeout`.
+- *(review)* The size a message declares is the sender's word. The bridge also cuts the download itself off once it is longer than the cap plus WhatsApp's encryption overhead (26 bytes), and refuses a server answer that announces more, so a small message pointing at a huge file costs at most the cap in memory; the answer is `media_too_large`. For a voice note the duration is read from the downloaded file where it can be (Ogg Opus) and checked against `voiceMaxSeconds`; `media_ready.durationS` is then the file's own duration.
 - *(clarified)* v1 fetches only `voice` and `image` messages (owner decision: video, documents, stickers and other audio stay on the phone). For any other kind the bridge keeps no download descriptor, so `fetch_media` answers `unknown_message`. `chatJid` is the JID under which the message was reported, or the phone-number JID of a chat merged through `aliasOf`. At most two downloads run at once; more wait.
 
 ### 6.9 `ack`
@@ -291,7 +301,7 @@ After linking, the phone sends recent history in several parts. The bridge turns
 
 Media bytes never travel on the pipes.
 
-1. `fetch_media` → the bridge downloads the file from WhatsApp (whatsmeow verifies WhatsApp's hashes) and checks the size and duration limits again.
+1. `fetch_media` → the bridge downloads the file from WhatsApp (whatsmeow verifies WhatsApp's hashes) and checks the size and duration limits again, on the real bytes. *(review)* The download is cut off past the cap (§6.8).
 2. It writes the file to `<mediaDir>/<random 32 hex>.bin` in this format: `nonce (12 bytes) ‖ ciphertext ‖ tag (16 bytes)`, AES-256-GCM, with a **fresh random 32-byte key** for this file and no additional data. Caps (§6.1): images ≤ 16 MiB, voice notes ≤ 60 minutes and ≤ 32 MiB, checked against the description before downloading and against the real size after.
 3. It replies `media_ready {replyTo, messageId, path, key, sha256, mime, sizeBytes, durationS?}`: `path` is absolute and inside `mediaDir`; `key` is the 32-byte key as 64 hex characters; `sha256` is the hex SHA-256 of the **plaintext**; `sizeBytes` is the plaintext size.
 4. The client reads the file, decrypts, checks `sha256`, and **deletes the file**. The bridge deletes `.bin` files older than 1 hour in `mediaDir` at start.
@@ -316,6 +326,7 @@ Media bytes never travel on the pipes.
 | `pair_failed` | the pairing request was refused | yes |
 | `not_connected` | offline; nothing was sent | yes |
 | `busy` | a send is already in flight | yes |
+| `rate_limited_local` | *(review)* the bridge's own send backstop (§6.5); nothing was sent | yes |
 | `duplicate_outbox_id` | this `outboxId` was already used | no |
 | `unknown_chat` / `unknown_message` | not known to the bridge | no |
 | `rate_limited` | WhatsApp refused for rate reasons | yes |
@@ -328,29 +339,62 @@ Media bytes never travel on the pipes.
 | `client_outdated` | WhatsApp requires a newer client (fatal, exit 5) | no |
 | `internal` | anything else | no |
 
-**Exit codes:** 0 normal · 1 unexpected crash · 2 no `init` within 10 s · 3 store key invalid · 4 store locked · 5 client outdated after the retry · *(clarified)* 64 unknown command-line arguments (a person's typo; clients pass none).
+**Exit codes** *(review: 6 and 7 added, 2 moved)*:
+
+| code | meaning |
+|---|---|
+| 0 | normal end (`shutdown`, stdin EOF) |
+| 1 | a panic caught on the main goroutine |
+| 2 | never chosen by the bridge: the Go runtime's code for an unrecovered panic or a fatal runtime error. Treat it as a crash. |
+| 3 | store key invalid |
+| 4 | store locked |
+| 5 | client outdated after the bridge's own retry (§5.4) |
+| 6 | no `init` within 10 s |
+| 7 | logged out: the store was deleted; restart only with a new key (§6.4) |
+| 64 | *(clarified)* unknown command-line arguments (a person's typo; clients pass none) |
+
+Any other code, or death by a signal, is a crash.
 
 ## 10. Guarantees the bridge makes
 
 ### 10.1 Storage
 - The session store is a SQLite database encrypted with Adiantum (pure-Go SQLite, `ncruces/go-sqlite3`), using the key from `init`. The database, its WAL and its journal are encrypted. Temporary tables stay in memory. Without the key the file cannot be read, and the bridge never recreates a store it cannot open.
-- The folder is owner-only (`0700`, files `0600`) on macOS and Linux. On Windows it inherits the user profile's permissions.
+- The folder is owner-only (`0700`, files `0600`) on macOS and Linux. On Windows it inherits the user profile's permissions (§14). *(review)* The process runs with umask `077`, so every file is owner-only from its creation, and an existing `storeDir` or `mediaDir` with wider permissions is tightened to `0700` at `init`.
+- *(review)* Every commit is durable across a power loss (`PRAGMA synchronous=FULL`), above all the `outboxId` reservation made before a send.
 - Besides whatsmeow's own tables, the store holds three small tables: sent `outboxId`s (the last 1,000, with the message id WhatsApp gave them), the download descriptors of reported voice and image messages (pruned after 90 days), and the JIDs of reported chats (for `unknown_chat` and `aliasOf`). It holds no message text. *(clarified: the third table.)*
 - *(clarified)* The key is applied with `PRAGMA hexkey` on each new database connection, never in the file name or URI. The store file is `<storeDir>/store.db` (plus `-wal`/`-shm` while open) and the lock is `<storeDir>/bridge.lock`.
 - Only one bridge can use a store at a time (an OS file lock).
 
 ### 10.2 Network
-- The bridge connects only to WhatsApp hosts: `web.whatsapp.com`, `*.whatsapp.net` and `*.whatsapp.com`. Every connection, including redirects and the WhatsApp Web version check, goes through one allowlist that refuses any other host **before** connecting. The list is compiled into the program. Proxy environment variables are ignored. *(clarified)* Only TCP port 443 is dialed and redirects must stay on `https`; IP literals, `localhost` and bare `whatsapp.net`/`whatsapp.com` are refused. Media downloads use hosts under `whatsapp.net` (for example `mmg.whatsapp.net`, `media-<site>.cdn.whatsapp.net`); the list is confirmed on a live account in the owner's test and changed only by a new release.
+- The bridge connects only to WhatsApp hosts: `web.whatsapp.com`, `*.whatsapp.net` and `*.whatsapp.com`. Every connection, including redirects and the WhatsApp Web version check, goes through one allowlist that refuses any other host **before** connecting. The list is compiled into the program. Proxy environment variables are ignored. *(clarified)* Only TCP port 443 is dialed and redirects must stay on `https`; IP literals, `localhost` and bare `whatsapp.net`/`whatsapp.com` are refused. *(review)* An allowed name is resolved by the bridge, and only public addresses are dialed: an answer that points at a loopback, private, link-local, shared (100.64.0.0/10), unspecified, multicast or broadcast address is refused before connecting (`host_blocked`). TLS still verifies the certificate for the name. Media downloads use hosts under `whatsapp.net` (for example `mmg.whatsapp.net`, `media-<site>.cdn.whatsapp.net`); the list is confirmed on a live account in the owner's test and changed only by a new release.
 - The bridge never fetches `flags.json` or anything else outside WhatsApp.
 
 ### 10.3 Behaviour
 - No presence is ever sent: the linked device never appears "online".
 - Media is downloaded only on `fetch_media`.
-- No address book, status updates, broadcast lists or newsletters are read or reported.
-- One send at a time, never retried, never repeated for the same `outboxId`.
+- No status updates, broadcast lists or newsletters are read or reported. *(review, corrected)* The address book is never **reported**: WhatsApp's own app-state sync gives every linked device the phone's contact names, and whatsmeow keeps them in the encrypted store (they are used only for the names of reported chats and senders, §5.13). No command reads it out.
+- One send at a time, never retried by the bridge, never repeated for the same `outboxId`, and no faster than the backstop (§6.5; for resends inside the connection library, see there).
 
 ### 10.4 Diagnostics (stderr)
 stderr carries JSON lines `{"t":<ms>,"level":"info|warn|error","event":"<fixed name>","code"?:"…","n"?:<number>}`. There is never message text, a name, a phone number, a JID, a QR string, a pairing code, a key or a path. whatsmeow's own log messages are reduced to their constant format string, without arguments. A client may keep these lines in its own log.
+
+*(review)* The rules that make this hold, and what a client must do:
+- `event` is one of the fixed names below; any other name is written as `invalid_event`. `code` is one of the bridge's fixed codes (an error code of §9, a `status` state, a `signal` kind, a logout or pairing reason, a command or event type, or one of `too_long`, `invalid`, `event`, `history`, `command`, `async`, `alias`, `chats`, `media`, `outbox`, `phone`, `qr`), or `redacted`. Only for `event: "whatsmeow"` is `code` a constant format string of the library, prefixed by its module (`Client/Socket: …`), with anything that looks like a number of 5+ digits, a 16+ character hex or base64 run, `@` or `+` replaced by `redacted`.
+- The bridge writes its lines to its own copy of stderr and points the process's standard error at a pipe it throws away. Whatever else would write to stderr (the Go runtime's report of a crash, with the panic value and stack, or a library print) does not reach the client. A panic inside the bridge's own work is caught and logged as `panic_recovered` with a constant code; the command that caused it gets `error {internal}`.
+- A client MUST parse stderr strictly: keep only lines that are this JSON with a listed `event`, and drop (and count) everything else.
+
+Events, by area:
+
+| area | events |
+|---|---|
+| process and stdio | `started`, `stdin_eof`, `shutdown`, `init_timeout`, `line_dropped` (`code` `too_long` or `invalid`, `n` the count), `emit_failed`, `panic`, `panic_recovered`, `stop_timeout`, `exit_logged_out` |
+| init and store | `ready`, `fatal`, `store_open_failed`, `store_close_failed`, `store_wiped`, `store_wipe_failed`, `store_write_failed`, `media_prune_failed`, `media_stale_deleted` |
+| connection and pairing | `status`, `signal`, `connect_failed`, `host_blocked`, `logged_out`, `pairing_started`, `pairing_failed`, `pairing_timeout`, `paired`, `version_refreshed`, `version_refresh_failed` |
+| commands | `command_refused`, `send_ok`, `send_failed`, `send_refused`, `fetch_failed`, `group_info_failed`, `joined_groups_failed` |
+| history | `history_capped`, `history_done`, `history_download_failed` |
+| library | `whatsmeow` |
+
+New names may be added within v1; a client that does not know a name drops the line.
 
 ## 11. `flags.json` (a pause switch for clients; the bridge does not read it)
 
@@ -368,7 +412,7 @@ The payload, before base64, is JSON: `{"v":1,"issuedAt":<ms>,"deepSync":{"enable
 
 *(clarified)* `maxBridgeVersion` is `MAJOR.MINOR.PATCH` without a `v` or suffix. The payload bytes are written with no spaces, in the member order shown. The signing tool is `cmd/flags-sign`; the `flags` workflow runs it in a protected environment that needs the maintainer's approval for every run.
 
-The file is changed only by this repository's `flags` workflow, which the maintainer approves by hand. The `flags` prerelease is never marked "latest".
+The file is changed only by this repository's `flags` workflow, which the maintainer approves by hand. The `flags` prerelease is never marked "latest". *(review)* The workflow runs only from `main`: the `flags` environment allows only `main` (without an administrator bypass), the job refuses any other ref, and a step checks again before the key is read. Release tags `v*` are protected by a ruleset.
 
 ## 12. Trying it from a shell
 
@@ -385,3 +429,21 @@ KEY=$(head -c 32 /dev/urandom | xxd -p -c 64)   # keep it: the store needs the s
 ```
 
 Any ULID generator works for `id` (the ones above are only examples). Real ids MUST be unique per session.
+
+## 13. Release files and versions
+
+*(review, lead decision 2026-09-25)*
+
+- A release is a GitHub Release of this repository tagged `vMAJOR.MINOR.PATCH`. Its binaries are named exactly `voolo-whatsapp-bridge-<goos>-<goarch>`, plus `.exe` on Windows: `voolo-whatsapp-bridge-windows-amd64.exe`, `voolo-whatsapp-bridge-darwin-arm64`, `voolo-whatsapp-bridge-darwin-amd64`, `voolo-whatsapp-bridge-linux-amd64`. Next to them: `SHA256SUMS` (one line per binary, `<sha256>  <name>`), `go-licenses.csv`, `go-licenses-README.md`, and a build-provenance attestation for each binary.
+- The version inside the binary (`--version`, `hello.version`) is the tag without its `v`. Versions are compared as three numbers, never with a `v` (§5.1, §11).
+- Every release is rebuilt from its tag on a second runner and must give the same `SHA256SUMS` before it is published.
+
+## 14. Known limits
+
+*(review)* Findings of the P1-A security review that are not fully closed, with the reason:
+
+- **Windows permissions** (review L5). On Windows the store and media folders are not given an explicit owner-only ACL; they inherit the per-user profile's ACL (`%APPDATA%` or `%LOCALAPPDATA%` is readable only by the user, SYSTEM and administrators by default). An explicit protected DACL needs testing on real Windows machines and is left to the Windows hardening task of the client. The store itself is encrypted either way.
+- **Windows crash output** (review M1). On Windows the redirection of the process's standard error (§10.4) is built and type-checked, but not yet run in a test on Windows; a client MUST drop non-JSON stderr lines in any case.
+- **Crash output larger than 64 KiB.** If a crash report ever exceeded the pipe buffer while the runtime has stopped every other goroutine, the process could hang instead of exiting with 2; the client's ping (§6.10) then restarts it.
+- **The backstop counts per store** (§6.5). It survives restarts through the store, but not a deleted store; it is a last defence, the client's own caps come first.
+- **Duration of non-Ogg voice** (§6.8). A received voice note that is not Ogg Opus keeps the duration its sender declared; its size is still capped on the real bytes.

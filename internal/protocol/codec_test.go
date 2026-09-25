@@ -126,6 +126,7 @@ func TestInvalidExamples(t *testing.T) {
 		"init-short-key.json":            ErrBadRequest,
 		"init-limits-above-ceiling.json": ErrBadRequest,
 		"mark_read-too-many.json":        ErrBadRequest,
+		"send_text-lone-surrogate.json":  ErrBadRequest,
 	}
 	for name, code := range expect {
 		env, err := ParseEnvelope(ex[name])
@@ -140,6 +141,9 @@ func TestInvalidExamples(t *testing.T) {
 		case code == ErrPhoneInvalid && !errors.Is(err, PhoneInvalid):
 			t.Errorf("%s: want phone_invalid, got %v", name, err)
 		}
+	}
+	if _, err := ParseEnvelope(ex["ulid-overflow.json"]); !errors.Is(err, ErrDrop) {
+		t.Errorf("ULID above 128 bits: want drop, got %v", err)
 	}
 	if _, err := ParseEnvelope(ex["extra-envelope-field.json"]); !errors.Is(err, ErrDrop) {
 		t.Errorf("extra envelope field: want drop, got %v", err)
@@ -207,10 +211,10 @@ func TestCommandStrictness(t *testing.T) {
 		{CmdMarkRead, `{"chatJid":"15550100002@s.whatsapp.net","messageIds":[]}`, false},
 		{CmdMarkRead, `{"chatJid":"15550100002@s.whatsapp.net","messageIds":["3EB0"]}`, true},
 		{CmdFetchMedia, `{"chatJid":"15550100002@s.whatsapp.net","messageId":"3EB0","extra":1}`, false},
-		{CmdPairPhone, `{"phone":"+201001234567"}`, false},
+		{CmdPairPhone, `{"phone":"+15550100001"}`, false},
 		{CmdPairPhone, `{"phone":"123456"}`, false},
 		{CmdPairPhone, `{"phone":"1234567890123456"}`, false},
-		{CmdPairPhone, `{"phone":"201001234567"}`, true},
+		{CmdPairPhone, `{"phone":"15550100001"}`, true},
 	}
 	for _, c := range cases {
 		err := cmd(c.typ, c.payload)
@@ -330,5 +334,46 @@ func TestULIDs(t *testing.T) {
 	fixed := NewIDSource(func() time.Time { return time.UnixMilli(0) })
 	if id := fixed.New(); !strings.HasPrefix(id, "0000000000") {
 		t.Fatalf("time part wrong: %s", id)
+	}
+}
+
+// Review L2: text that is not valid UTF-8, raw or as a lone surrogate escape,
+// is refused, never silently changed to U+FFFD and sent.
+func TestInvalidUTF8Refused(t *testing.T) {
+	head := `{"chatJid":"15550100002@s.whatsapp.net","outboxId":"01M3C03V80N87VFZS5G0J0NFEX","text":"`
+	for _, p := range []string{
+		head + "a" + string([]byte{0xff}) + "b\"}",
+		head + `\ud800"}`,
+		head + `x\udc00"}`,
+		head + `\ud800\u0041"}`,
+		head + `\ud83d"}`,
+		head + string([]byte{0xc3}) + `"}`,
+	} {
+		if err := cmd(CmdSendText, p); err == nil {
+			t.Errorf("accepted %q", p)
+		}
+	}
+	for _, p := range []string{
+		head + `\ud83d\ude00 ok"}`, // a valid surrogate pair (an emoji)
+		head + `\\ud800 is text"}`, // an escaped backslash, not an escape
+		head + "صباح الخير 😀\"}",
+	} {
+		if err := cmd(CmdSendText, p); err != nil {
+			t.Errorf("refused %q: %v", p, err)
+		}
+	}
+}
+
+// Review L11: a ULID above 128 bits (first character 8-Z) is refused.
+func TestULIDOverflowRefused(t *testing.T) {
+	for _, id := range []string{"8ZZZZZZZZZZZZZZZZZZZZZZZZZ", "ZZZZZZZZZZZZZZZZZZZZZZZZZZ", "80000000000000000000000000"} {
+		if IsULID(id) {
+			t.Errorf("%s accepted", id)
+		}
+	}
+	for _, id := range []string{"7ZZZZZZZZZZZZZZZZZZZZZZZZZ", "01M3C03V80YKN5QVM42E69359G"} {
+		if !IsULID(id) {
+			t.Errorf("%s refused", id)
+		}
 	}
 }

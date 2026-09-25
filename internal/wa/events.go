@@ -58,7 +58,7 @@ func (b *Bridge) onEvent(s *session, evt any) {
 	case *events.LoggedOut:
 		reason := LogoutReason(e.Reason)
 		b.cfg.Log.Warn("logged_out", logx.Code(reason))
-		b.async(func() { b.resetAfterLogout(s, reason, int(e.Reason)) })
+		b.async(func() { b.loggedOutBy(s, reason, int(e.Reason), "") })
 	case *events.StreamReplaced, *events.TemporaryBan:
 		b.setState(protocol.StateStopped)
 	case *events.ConnectFailure:

@@ -32,11 +32,15 @@ type deps struct {
 
 func defaultDeps() deps { return deps{initTimeout: 10 * time.Second} }
 
+// bareVersion is the version without a leading "v" (MAJOR.MINOR.PATCH, as in
+// hello.version and flags.json maxBridgeVersion; PROTOCOL.md §5.1).
+func bareVersion() string { return strings.TrimPrefix(version, "v") }
+
 func sourceURL() string {
 	if version == "" || strings.Contains(version, "dev") {
 		return bridge.SourceRepo
 	}
-	return bridge.SourceRepo + "/tree/v" + strings.TrimPrefix(version, "v")
+	return bridge.SourceRepo + "/tree/v" + bareVersion()
 }
 
 func flags(args []string, stdout, stderr io.Writer) int {
@@ -46,7 +50,7 @@ func flags(args []string, stdout, stderr io.Writer) int {
 	}
 	switch args[0] {
 	case "--version", "-version":
-		fmt.Fprintln(stdout, "voolo-whatsapp-bridge "+version+" (protocol 1)")
+		fmt.Fprintln(stdout, "voolo-whatsapp-bridge "+bareVersion()+" (protocol 1)")
 	case "--license", "-license":
 		fmt.Fprintln(stdout, "voolo-whatsapp-bridge is free software under the GNU General Public License v3.0 or later.")
 		fmt.Fprintln(stdout, "Source: "+sourceURL())
@@ -76,11 +80,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) (code
 	out := protocol.NewWriter(stdout, nil)
 
 	var b *wa.Bridge
-	httpClient := transport.NewClient(transport.Options{OnBlock: func() {
+	netOpts := transport.Options{OnBlock: func() {
 		if b != nil {
 			b.HostBlocked()
 		}
-	}})
+	}}
+	httpClient := transport.NewClient(netOpts)
+	mediaClient := transport.NewMediaClient(netOpts)
 	cfg := wa.Config{
 		Out: out,
 		Log: log,
@@ -92,7 +98,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) (code
 			if err != nil {
 				return nil, err
 			}
-			return wa.NewRealClient(dev, httpClient, logx.NewWA(log, "Client")), nil
+			return wa.NewRealClient(dev, httpClient, mediaClient, logx.NewWA(log, "Client")), nil
 		},
 		RefreshVersion: func(ctx context.Context) error { return wa.RefreshWAVersion(ctx, httpClient) },
 	}
@@ -101,7 +107,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) (code
 	}
 	b = wa.New(cfg)
 
-	if err := out.Emit(protocol.EvHello, protocol.Hello{Bridge: "voolo-whatsapp-bridge", Version: version, Protocol: protocol.Version, OS: runtime.GOOS, Arch: runtime.GOARCH}); err != nil {
+	if err := out.Emit(protocol.EvHello, protocol.Hello{Bridge: "voolo-whatsapp-bridge", Version: bareVersion(), Protocol: protocol.Version, OS: runtime.GOOS, Arch: runtime.GOARCH}); err != nil {
 		return wa.ExitCrash
 	}
 	log.Info("started")
@@ -110,6 +116,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) (code
 	lines := make(chan []byte)
 	go func() {
 		defer close(lines)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("panic_recovered", logx.Code("command"))
+			}
+		}()
 		for {
 			l, err := lr.Next()
 			if err != nil {

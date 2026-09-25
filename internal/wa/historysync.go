@@ -58,7 +58,7 @@ func (b *Bridge) historyLoop(s *session) {
 		}
 		n := s.pop()
 		if n != nil {
-			b.processHistory(s, n)
+			b.processHistorySafe(s, n)
 			continue
 		}
 		s.hmu.Lock()
@@ -76,6 +76,17 @@ func (b *Bridge) historyLoop(s *session) {
 			b.historyDone(s)
 		}
 	}
+}
+
+// processHistorySafe processes one notification; a panic drops only that
+// notification, with a constant code on stderr, and the worker goes on.
+func (b *Bridge) processHistorySafe(s *session, n *waE2E.HistorySyncNotification) {
+	defer func() {
+		if r := recover(); r != nil {
+			b.cfg.Log.Error("panic_recovered", logx.Code("history"))
+		}
+	}()
+	b.processHistory(s, n)
 }
 
 func (b *Bridge) historyDone(s *session) {

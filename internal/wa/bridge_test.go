@@ -8,6 +8,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -414,7 +415,7 @@ func TestSignalsAndLogout(t *testing.T) {
 	}
 }
 
-func TestLoggedOutReasonsWipeStore(t *testing.T) {
+func TestLoggedOutReasonsWipeStoreAndExit(t *testing.T) {
 	for reason, want := range map[events.ConnectFailureReason]string{
 		events.ConnectFailureLoggedOut: "device_removed", events.ConnectFailureMainDeviceGone: "primary_gone",
 		events.ConnectFailureUnknownLogout: "banned", events.ConnectFailureReason(400): "unknown",
@@ -424,56 +425,35 @@ func TestLoggedOutReasonsWipeStore(t *testing.T) {
 		f.dispatch(textMsg(mustParse(alice), mustParse(alice), "3EB0Z", "x", false))
 		h.expect(protocol.EvMessage)
 		f.dispatch(&events.LoggedOut{Reason: reason})
+		// The bridge asks to exit (PROTOCOL.md §6.4, review M3); the caller stops it.
+		h.expectExit(ExitLoggedOut)
+		h.b.Stop()
 		lo := field[protocol.LoggedOut](h.expect(protocol.EvLoggedOut))
 		if lo.Reason != want || lo.Code != int(reason) {
 			t.Fatalf("%d: %+v", reason, lo)
 		}
 		h.expectState(protocol.StateStopped)
-		h.expectState(protocol.StateUnpaired)
-		// The store was wiped and a fresh one opened: the reported chat is gone.
-		chats, err := h.b.current().st.Chats(context.Background())
-		if err != nil || len(chats) != 0 {
-			t.Fatalf("store not wiped: %v %v", chats, err)
+		// The store file is gone and no new one was opened under the old key.
+		if fileExists(filepath.Join(h.storeDir, store.DBFile)) {
+			t.Fatalf("%d: store not wiped", reason)
 		}
-		h.b.Stop()
+		h.mu.Lock()
+		opens := h.opens
+		h.mu.Unlock()
+		if opens != 1 {
+			t.Fatalf("%d: store opened %d times", reason, opens)
+		}
 	}
 }
 
-func TestLogoutCommandUnlinksAndDeletesStore(t *testing.T) {
-	h := newHarness(t, pairedFake)
-	f := h.initPairedConnected()
-	f.dispatch(textMsg(mustParse(alice), mustParse(alice), "3EB0Z", "x", false))
-	h.expect(protocol.EvMessage)
-	old := h.b.current().st
-	id := h.cmd("logout", map[string]any{})
-	lo := field[protocol.LoggedOut](h.expect(protocol.EvLoggedOut))
-	if lo.Reason != "user" {
-		t.Fatalf("%+v", lo)
-	}
-	if reply(h.expect(protocol.EvOK)) != id {
-		t.Fatal("ok replyTo")
-	}
-	if f.logouts != 1 {
-		t.Fatal("whatsmeow Logout not called")
-	}
-	if old.DB != nil {
-		t.Fatal("old store still open")
-	}
-	chats, _ := h.b.current().st.Chats(context.Background())
-	if len(chats) != 0 {
-		t.Fatal("store not deleted")
-	}
-	h.expectError(h.cmd("logout", map[string]any{}), protocol.ErrNotPaired)
-}
-
+// Lead decision (2026-09-25): on a 405 the bridge refreshes the WhatsApp Web
+// version and reconnects once by itself; the client_outdated signal is sent
+// only when that retry fails too.
 func TestClientOutdatedRefreshOnceThenFatal(t *testing.T) {
 	h := newHarness(t, pairedFake)
 	f := h.initPairedConnected()
 	f.dispatch(&events.ClientOutdated{})
-	if s := field[protocol.Signal](h.expect(protocol.EvSignal)); s.Kind != "client_outdated" {
-		t.Fatal(s)
-	}
-	time.Sleep(100 * time.Millisecond)
+	h.none(protocol.EvSignal, 150*time.Millisecond)
 	h.mu.Lock()
 	refreshed := h.refresh
 	h.mu.Unlock()
@@ -484,10 +464,32 @@ func TestClientOutdatedRefreshOnceThenFatal(t *testing.T) {
 		t.Fatalf("refresh %d connects %d", refreshed, connects)
 	}
 	f.dispatch(&events.ClientOutdated{})
-	h.expect(protocol.EvSignal)
+	if s := field[protocol.Signal](h.expect(protocol.EvSignal)); s.Kind != "client_outdated" {
+		t.Fatal(s)
+	}
 	e := field[protocol.ErrorEvent](h.expect(protocol.EvError))
 	if e.Code != "client_outdated" || !e.Fatal {
 		t.Fatalf("%+v", e)
+	}
+	if code := <-h.b.Fatal(); code != ExitClientOutdated {
+		t.Fatalf("exit %d", code)
+	}
+	h.mu.Lock()
+	refreshed = h.refresh
+	h.mu.Unlock()
+	if refreshed != 1 {
+		t.Fatalf("refreshed %d times", refreshed)
+	}
+}
+
+// A failed version refresh counts as the failed retry.
+func TestClientOutdatedRefreshFailsIsFatal(t *testing.T) {
+	h := newHarness(t, pairedFake)
+	f := h.initPairedConnected()
+	h.b.cfg.RefreshVersion = func(context.Context) error { return errors.New("offline") }
+	f.dispatch(&events.ClientOutdated{})
+	if s := field[protocol.Signal](h.expect(protocol.EvSignal)); s.Kind != "client_outdated" {
+		t.Fatal(s)
 	}
 	if code := <-h.b.Fatal(); code != ExitClientOutdated {
 		t.Fatalf("exit %d", code)
@@ -569,7 +571,8 @@ func TestSendSingleFlight(t *testing.T) {
 	if r := field[protocol.SendResult](h.expect(protocol.EvSendResult)); r.ReplyTo != first {
 		t.Fatal("first send result")
 	}
-	// The refused one was not reserved: it can be sent now.
+	// The refused one was not reserved: it can be sent now (after the 1 s floor).
+	h.advance(time.Second)
 	h.cmd("send_text", map[string]any{"chatJid": alice, "text": "two", "outboxId": "01M3C03V80N87VFZS5G0J0NFE5"})
 	h.expect(protocol.EvSendResult)
 }
@@ -632,7 +635,7 @@ func TestSendMedia(t *testing.T) {
 	h := newHarness(t, pairedFake)
 	f := h.initPairedConnected()
 	h.knownChat(f)
-	sealed := sealForTest(t, h.mediaDir, []byte("OggS fake voice"))
+	sealed := sealForTest(t, h.mediaDir, oggStream(14))
 	id := h.cmd("send_media", map[string]any{"chatJid": alice, "outboxId": "01M3C03V80N87VFZS5G0J0NFE8", "kind": "voice", "path": sealed.path,
 		"key": sealed.key, "sha256": sealed.sha, "mime": "audio/ogg; codecs=opus"})
 	if r := field[protocol.SendResult](h.expect(protocol.EvSendResult)); r.ReplyTo != id {
@@ -641,6 +644,7 @@ func TestSendMedia(t *testing.T) {
 	if !f.sent[0].msg.GetAudioMessage().GetPTT() || fileExists(sealed.path) {
 		t.Fatal("voice note not sent as PTT, or hand-off file kept")
 	}
+	h.advance(time.Second)
 	bad := sealForTest(t, h.mediaDir, []byte("x"))
 	id = h.cmd("send_media", map[string]any{"chatJid": alice, "outboxId": "01M3C03V80N87VFZS5G0J0NFE9", "kind": "image", "path": bad.path,
 		"key": strings.Repeat("00", 32), "sha256": bad.sha, "mime": "image/jpeg"})
@@ -706,6 +710,8 @@ func TestFetchMedia(t *testing.T) {
 func TestMarkRead(t *testing.T) {
 	h := newHarness(t, pairedFake)
 	f := h.initPairedConnected()
+	f.dispatch(textMsg(mustParse(group), mustParse(bob), "3EB0C4", "hi", false))
+	h.expect(protocol.EvMessage)
 	id := h.cmd("mark_read", map[string]any{"chatJid": group, "messageIds": []string{"3EB0C4"}, "senderJid": bob})
 	if reply(h.expect(protocol.EvOK)) != id {
 		t.Fatal("ok")
@@ -816,7 +822,7 @@ func TestHistoryPerChatCap(t *testing.T) {
 	}
 }
 
-func TestHistoryReactionsAndCapsResetAfterLogout(t *testing.T) {
+func TestHistoryReactionsThenLogoutExits(t *testing.T) {
 	h := newHarness(t, pairedFake)
 	h.init(map[string]any{"historyDays": 90, "historyMaxPerChat": 2, "imageMaxBytes": 1 << 20, "voiceMaxSeconds": 300})
 	f := h.fake()
@@ -845,17 +851,10 @@ func TestHistoryReactionsAndCapsResetAfterLogout(t *testing.T) {
 		t.Fatalf("history reaction %+v", r)
 	}
 	h.cmd("ack", map[string]any{"seq": b.Seq})
+	// A logout ends the process (review M3): a new account always starts in a
+	// new bridge process, with fresh per-chat counts and a new store key.
 	f.dispatch(&events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
-	h.expectState(protocol.StateUnpaired)
-	// A new account on the same bridge process starts with fresh per-chat counts.
-	f2 := h.fake()
-	f2.mu.Lock()
-	f2.account = AccountInfo{JID: mustParse(me)}
-	f2.mu.Unlock()
-	push(f2, "3EB0S1", "3EB0S2")
-	if b := field[protocol.HistoryBatch](h.expect(protocol.EvHistoryBatch)); len(b.Messages) != 2 {
-		t.Fatalf("after logout: %d messages", len(b.Messages))
-	}
+	h.expectExit(ExitLoggedOut)
 }
 
 // ------------------------------------------------------------ guarantees

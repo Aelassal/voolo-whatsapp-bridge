@@ -19,7 +19,7 @@ It is built on [whatsmeow](https://github.com/tulir/whatsmeow). Anyone can use i
 - **Separate program, separate repository.** This repository contains no Voolo code, and Voolo contains none of this repository's code. The only interface between them is the protocol in `PROTOCOL.md`, over the program's stdin and stdout.
 - **Downloaded, not bundled.** Voolo's installer does not include this program. The first time a user links WhatsApp in Voolo, Voolo downloads the release binary for that platform from this repository's GitHub Releases, checks its size and SHA-256 against the values pinned in Voolo's own source, and runs it as a child process. A new bridge version reaches Voolo users only through a Voolo update that changes the pin.
 - **Local only.** The session store and every message stay on the user's computer. The program connects only to WhatsApp hosts, enforced by a compiled-in allowlist. Voolo keeps the store's encryption key in the operating system's keychain and hands it to the bridge on stdin when the program starts. The key never appears in arguments, environment variables, files or logs.
-- **Conservative by design.** The protocol has no bulk, broadcast, scheduled or templated sending: one message, to one chat, at a time. The bridge never marks you online, never downloads media unless asked, and never exports your address book. Voolo adds its own limits on top: a consent screen, a send cap, pauses when WhatsApp signals throttling, and a remote pause switch (`flags.json`, below).
+- **Conservative by design.** The protocol has no bulk, broadcast, scheduled or templated sending: one message, to one chat, at a time, and the bridge itself refuses more than one send per second or 30 per 10 minutes. The bridge never marks you online, never downloads media unless asked, and never exports your address book. After a logout it deletes its store and exits; linking again needs a new store key. Voolo adds its own limits on top: a consent screen, a send cap, pauses when WhatsApp signals throttling, and a remote pause switch (`flags.json`, below).
 
 ### `flags.json`
 
@@ -41,7 +41,7 @@ go test ./...          # nothing in the tests connects to WhatsApp: a fake stand
 go test -race ./...    # needs a C compiler for the race detector only
 ```
 
-Releases are built by GitHub Actions (`.github/workflows/release.yml`) from a tag `vX.Y.Z`. Each release publishes one binary per platform (win-x64, mac-arm64, mac-x64, linux-x64), `SHA256SUMS`, the `go-licenses` report and a build-provenance attestation. A second job rebuilds from the tag and compares the hashes, so a release is reproducible from its source. OS code signing (Authenticode, Developer ID + notarization) will be added later.
+Releases are built by GitHub Actions (`.github/workflows/release.yml`) from a tag `vX.Y.Z`. Each release publishes one binary per platform, named `voolo-whatsapp-bridge-<goos>-<goarch>` (`-windows-amd64.exe`, `-darwin-arm64`, `-darwin-amd64`, `-linux-amd64`; `PROTOCOL.md` §13), `SHA256SUMS`, the `go-licenses` report and a build-provenance attestation. Only the attestation job can mint a signing token; tests, the licence tool and the build run without one. A second job rebuilds from the tag and compares the hashes, so a release is reproducible from its source. OS code signing (Authenticode, Developer ID + notarization) will be added later.
 
 ## Trying it from a shell
 
@@ -61,8 +61,9 @@ internal/media/              media hand-off files and size caps
 internal/logx/               content-free stderr diagnostics
 licenses/                    go-licenses report of the linked modules
 scripts/build-release.sh     reproducible build of the four release binaries
+scripts/check-licence-exception.sh  pins the one reviewed licence exception to its version and LICENSE hash
 examples/                    one example line per message type (CC0)
-.github/workflows/           ci (every push), release (tags v*), flags (manual, protected)
+.github/workflows/           ci (every push), release (tags v*), flags (manual, main only, protected)
 ```
 
 ## Disclaimer

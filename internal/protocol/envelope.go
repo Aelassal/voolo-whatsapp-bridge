@@ -29,10 +29,12 @@ const MaxLineBytes = 1 << 20
 
 var (
 	typeRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
-	ulidRe = regexp.MustCompile(`^[0-9A-HJKMNP-TV-Z]{26}$`)
+	// The first character carries only 3 bits of the 128 (review L11).
+	ulidRe = regexp.MustCompile(`^[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
 )
 
-// IsULID reports whether s is a 26-character Crockford base32 ULID.
+// IsULID reports whether s is a 26-character Crockford base32 ULID that fits
+// in 128 bits (first character 0-7).
 func IsULID(s string) bool { return ulidRe.MatchString(s) }
 
 // Envelope is one decoded line.

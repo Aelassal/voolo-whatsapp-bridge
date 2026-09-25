@@ -216,16 +216,17 @@ func (b *Bridge) pairEnd(s *session, reason string) bool {
 	return true
 }
 
-// clientOutdated handles WhatsApp's 405: refresh the Web version once and
-// reconnect; a second rejection is fatal (exit 5).
+// clientOutdated handles WhatsApp's 405 (lead decision 2026-09-25): the
+// first time, refresh the WhatsApp Web version and reconnect once, silently;
+// only if that retry is rejected again, or the refresh fails, send
+// signal{client_outdated}, end any pairing and exit 5.
 func (b *Bridge) clientOutdated(s *session) {
 	b.mu.Lock()
 	b.outdated++
 	n := b.outdated
 	b.mu.Unlock()
-	b.pairEnd(s, protocol.PairClientOutdated)
 	if n > 1 || b.cfg.RefreshVersion == nil {
-		b.failFatal("", protocol.ErrClientOutdated, ExitClientOutdated)
+		b.outdatedFatal(s)
 		return
 	}
 	b.async(func() {
@@ -233,13 +234,27 @@ func (b *Bridge) clientOutdated(s *session) {
 		defer cancel()
 		if err := b.cfg.RefreshVersion(ctx); err != nil {
 			b.cfg.Log.Error("version_refresh_failed")
-			b.failFatal("", protocol.ErrClientOutdated, ExitClientOutdated)
+			b.outdatedFatal(s)
 			return
 		}
 		b.cfg.Log.Info("version_refreshed")
-		if !s.cli.Account().JID.IsEmpty() {
+		switch {
+		case !s.cli.Account().JID.IsEmpty():
 			s.cli.Disconnect()
 			b.connect(s)
+		case b.currentPair(s) != nil:
+			// A pairing in progress: reopen its socket; new QR codes follow.
+			s.cli.Disconnect()
+			if err := s.cli.Connect(); err != nil {
+				b.cfg.Log.Warn("connect_failed")
+			}
 		}
 	})
+}
+
+func (b *Bridge) outdatedFatal(s *session) {
+	b.emit(protocol.EvSignal, protocol.Signal{Kind: protocol.SigClientOutdated})
+	b.cfg.Log.Warn("signal", logx.Code(protocol.SigClientOutdated))
+	b.pairEnd(s, protocol.PairClientOutdated)
+	b.failFatal("", protocol.ErrClientOutdated, ExitClientOutdated)
 }

@@ -31,8 +31,10 @@ jobs:
         run: scripts/build-release.sh 0.0.0 dist
       - name: licence check
         run: |
-          go install github.com/google/go-licenses@v1.6.0
           # go-sqlite3-wasm is MIT-0, which the classifier does not know (licenses/README.md).
+          # The exception holds only for the reviewed version and LICENSE file.
+          scripts/check-licence-exception.sh
+          go install github.com/google/go-licenses@v1.6.0
           "$(go env GOPATH)/bin/go-licenses" check ./cmd/voolo-whatsapp-bridge \
             --allowed_licenses=GPL-3.0,MPL-2.0,MIT,ISC,Apache-2.0,BSD-2-Clause,BSD-3-Clause \
             --ignore github.com/ncruces/go-sqlite3-wasm/v6

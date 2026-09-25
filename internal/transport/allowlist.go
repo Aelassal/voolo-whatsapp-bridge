@@ -92,20 +92,83 @@ func Guard(base DialFunc, onBlock func()) DialFunc {
 type Options struct {
 	// Dial is the underlying dialer (tests inject a fake). Default: net.Dialer.
 	Dial DialFunc
+	// Lookup resolves a host name (tests inject a fake). Default: the system resolver.
+	Lookup LookupFunc
 	// OnBlock is called for each refused connection or redirect.
 	OnBlock func()
 }
 
-// NewTransport returns the guarded transport.
+// LookupFunc resolves a host name to its addresses.
+type LookupFunc func(ctx context.Context, host string) ([]net.IPAddr, error)
+
+// PublicIP reports whether ip may be dialed: a global unicast address that is
+// not loopback, private (RFC 1918, RFC 4193), link-local, shared (RFC 6598),
+// unspecified, multicast or broadcast.
+func PublicIP(ip net.IP) bool {
+	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		if v4[0] == 100 && v4[1]&0xc0 == 64 { // 100.64.0.0/10, carrier-grade NAT
+			return false
+		}
+		if v4.Equal(net.IPv4bcast) || v4[0] == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// Resolve wraps a dialer so that an allowed name is resolved first and only
+// its public addresses are dialed, by IP (review L14). A poisoned resolver
+// that points a WhatsApp name at this machine or the local network is refused
+// before any connection. TLS still verifies the certificate for the name.
+func Resolve(lookup LookupFunc, base DialFunc, onBlock func()) DialFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, ErrHostBlocked
+		}
+		ips, err := lookup(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		var lastErr error
+		for _, ip := range ips {
+			if !PublicIP(ip.IP) || (network == "tcp4" && ip.IP.To4() == nil) || (network == "tcp6" && ip.IP.To4() != nil) {
+				continue
+			}
+			c, err := base(ctx, network, net.JoinHostPort(ip.IP.String(), port))
+			if err == nil {
+				return c, nil
+			}
+			lastErr = err
+		}
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		if onBlock != nil {
+			onBlock()
+		}
+		return nil, ErrHostBlocked
+	}
+}
+
+// NewTransport returns the guarded transport: names are checked against the
+// allowlist, then resolved, and only public addresses are dialed.
 func NewTransport(o Options) *http.Transport {
 	base := o.Dial
 	if base == nil {
 		d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 		base = d.DialContext
 	}
+	lookup := o.Lookup
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIPAddr
+	}
 	t := &http.Transport{
 		Proxy:                 nil, // never read HTTP(S)_PROXY / ALL_PROXY
-		DialContext:           Guard(base, o.OnBlock),
+		DialContext:           Guard(Resolve(lookup, base, o.OnBlock), o.OnBlock),
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          10,
 		IdleConnTimeout:       90 * time.Second,
@@ -136,4 +199,10 @@ func CheckRedirect(onBlock func()) func(req *http.Request, via []*http.Request) 
 // contexts instead.
 func NewClient(o Options) *http.Client {
 	return &http.Client{Transport: NewTransport(o), CheckRedirect: CheckRedirect(o.OnBlock)}
+}
+
+// NewMediaClient returns the client for media downloads and uploads: the
+// guarded transport plus the body limit of LimitBody.
+func NewMediaClient(o Options) *http.Client {
+	return &http.Client{Transport: LimitBody(NewTransport(o)), CheckRedirect: CheckRedirect(o.OnBlock)}
 }

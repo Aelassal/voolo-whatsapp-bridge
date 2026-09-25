@@ -21,7 +21,7 @@ var _ waLog.Logger = (*WA)(nil)
 func NewWA(l *Logger, module string) *WA { return &WA{l: l, module: module} }
 
 func (w *WA) emit(level Level, format string) {
-	w.l.Log(level, "whatsmeow", Code(w.module+": "+format))
+	w.l.Log(level, "whatsmeow", Format(w.module+": "+format))
 }
 
 // Warnf keeps the format string only.

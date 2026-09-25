@@ -29,6 +29,15 @@ import (
 // Overhead is the nonce plus the GCM tag.
 const Overhead = 12 + 16
 
+// DownloadOverhead is what WhatsApp's encrypted media adds to the plaintext:
+// up to 16 bytes of AES-CBC padding and a 10-byte MAC. A download of a file
+// capped at n bytes is cut off after n + DownloadOverhead bytes.
+const DownloadOverhead = 16 + 10
+
+// testHookAfterCheck, when set by a test, runs between the path check and the
+// read in Open.
+var testHookAfterCheck func(path string)
+
 // StaleAfter is the age after which leftover hand-off files are deleted at start.
 const StaleAfter = time.Hour
 
@@ -98,7 +107,10 @@ func InDir(dir, path string) bool {
 // Open reads, decrypts and checks a hand-off file written by the client for
 // send_media. The file must be a regular file (not a link) directly inside
 // dir; its plaintext must not exceed maxBytes and must hash to sha256Hex. The
-// file is deleted in every case once it has been looked at.
+// file is deleted in every case once it has been looked at. The file is
+// opened once and every check after the name is made on that open handle, so
+// a path swapped for a link, or a file truncated, after the first check is
+// refused (review L4).
 func Open(dir, path, keyHex, sha256Hex string, maxBytes int64) ([]byte, error) {
 	if !InDir(dir, path) {
 		return nil, ErrInvalid
@@ -108,10 +120,22 @@ func Open(dir, path, keyHex, sha256Hex string, maxBytes int64) ([]byte, error) {
 		return nil, ErrInvalid
 	}
 	defer os.Remove(path)
-	if fi.Size() < Overhead {
+	if testHookAfterCheck != nil {
+		testHookAfterCheck(path)
+	}
+	f, err := openNoFollow(path)
+	if err != nil {
 		return nil, ErrInvalid
 	}
-	if fi.Size()-Overhead > maxBytes {
+	defer f.Close()
+	hfi, err := f.Stat()
+	if err != nil || !hfi.Mode().IsRegular() || !os.SameFile(fi, hfi) {
+		return nil, ErrInvalid
+	}
+	if hfi.Size() < Overhead {
+		return nil, ErrInvalid
+	}
+	if hfi.Size()-Overhead > maxBytes {
 		return nil, ErrTooBig
 	}
 	key, err := hex.DecodeString(keyHex)
@@ -122,14 +146,15 @@ func Open(dir, path, keyHex, sha256Hex string, maxBytes int64) ([]byte, error) {
 	if err != nil || len(want) != 32 {
 		return nil, ErrInvalid
 	}
-	f, err := os.Open(path)
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+Overhead+1))
 	if err != nil {
 		return nil, ErrInvalid
 	}
-	data, err := io.ReadAll(io.LimitReader(f, maxBytes+Overhead+1))
-	f.Close()
-	if err != nil || int64(len(data)) > maxBytes+Overhead {
+	if int64(len(data)) > maxBytes+Overhead {
 		return nil, ErrTooBig
+	}
+	if len(data) < Overhead {
+		return nil, ErrInvalid // truncated after the size check
 	}
 	block, _ := aes.NewCipher(key)
 	gcm, _ := cipher.NewGCM(block)
@@ -142,6 +167,16 @@ func Open(dir, path, keyHex, sha256Hex string, maxBytes int64) ([]byte, error) {
 		return nil, ErrInvalid
 	}
 	return plain, nil
+}
+
+// Discard deletes a hand-off file named by a send_media that was refused
+// before the file was read (PROTOCOL.md §6.6: deleted in every case). Only a
+// hand-off name directly inside dir is touched; a link is removed, never its
+// target.
+func Discard(dir, path string) {
+	if InDir(dir, path) {
+		_ = os.Remove(path)
+	}
 }
 
 // CleanStale deletes hand-off files in dir older than StaleAfter. It returns
@@ -194,6 +229,12 @@ func CheckFetch(kind string, sizeBytes int64, durationS int, l Limits) error {
 		return fmt.Errorf("not fetchable")
 	}
 	return nil
+}
+
+// VoiceMime reports whether a send_media voice note's mime type is Ogg (Opus),
+// the only format whose duration the bridge reads from the file.
+func VoiceMime(m string) bool {
+	return m == "audio/ogg" || strings.HasPrefix(m, "audio/ogg;")
 }
 
 // MaxSendBytes is the size cap for a send_media kind.

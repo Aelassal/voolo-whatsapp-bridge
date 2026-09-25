@@ -371,6 +371,9 @@ const (
 	ErrHostBlocked        = "host_blocked"
 	ErrClientOutdated     = "client_outdated"
 	ErrInternal           = "internal"
+	// ErrRateLimitedLocal is the bridge's own send backstop (§6.5): not a
+	// WhatsApp answer, and nothing was sent.
+	ErrRateLimitedLocal = "rate_limited_local"
 )
 
 var retryable = map[string]bool{
@@ -379,6 +382,17 @@ var retryable = map[string]bool{
 	ErrNotConnected: true,
 	ErrBusy:         true,
 	ErrRateLimited:  true,
+
+	ErrRateLimitedLocal: true,
+}
+
+// ErrorCodes returns every error code of §9.
+func ErrorCodes() []string {
+	return []string{ErrBadRequest, ErrUnknownCommand, ErrUnsupportedVersion, ErrNotInitialized, ErrAlreadyInitialized,
+		ErrStoreKeyInvalid, ErrStoreLocked, ErrStoreIO, ErrNotPaired, ErrAlreadyPaired, ErrPhoneInvalid, ErrPairFailed,
+		ErrNotConnected, ErrBusy, ErrDuplicateOutboxID, ErrUnknownChat, ErrUnknownMessage, ErrRateLimited, ErrRateLimitedLocal,
+		ErrSendFailed, ErrTimeout, ErrMediaTooLarge, ErrMediaExpired, ErrMediaUnavailable, ErrMediaInvalid, ErrHostBlocked,
+		ErrClientOutdated, ErrInternal}
 }
 
 // Retryable reports the §9 "retryable" column for a code.

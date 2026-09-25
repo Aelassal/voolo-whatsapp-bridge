@@ -221,6 +221,11 @@ func DecodeCommand(typ string, payload json.RawMessage) (any, error) {
 	if !ok {
 		return nil, bad("unknown command")
 	}
+	// Text that is not valid UTF-8, raw or as a lone surrogate escape, is
+	// refused: encoding/json would silently turn it into U+FFFD (review L2).
+	if !utf8.Valid(payload) || loneSurrogate(payload) {
+		return nil, bad("invalid UTF-8")
+	}
 	if err := checkFields(payload, spec.fields, spec.nested); err != nil {
 		return nil, err
 	}
@@ -232,6 +237,54 @@ func DecodeCommand(typ string, payload json.RawMessage) (any, error) {
 		return nil, err
 	}
 	return v, nil
+}
+
+// loneSurrogate reports whether raw JSON holds a \uXXXX escape of a UTF-16
+// surrogate that is not part of a high-low pair. Outside strings a backslash
+// is not valid JSON, so escapes are found without tracking string state.
+func loneSurrogate(raw []byte) bool {
+	hex4 := func(i int) (rune, bool) {
+		if i+6 > len(raw) || raw[i] != '\\' || raw[i+1] != 'u' {
+			return 0, false
+		}
+		var r rune
+		for _, c := range raw[i+2 : i+6] {
+			switch {
+			case c >= '0' && c <= '9':
+				r = r<<4 | rune(c-'0')
+			case c >= 'a' && c <= 'f':
+				r = r<<4 | rune(c-'a'+10)
+			case c >= 'A' && c <= 'F':
+				r = r<<4 | rune(c-'A'+10)
+			default:
+				return 0, false
+			}
+		}
+		return r, true
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		r, ok := hex4(i)
+		if !ok {
+			i++ // a two-character escape such as \\ or \"
+			continue
+		}
+		switch {
+		case r >= 0xD800 && r <= 0xDBFF:
+			lo, ok := hex4(i + 6)
+			if !ok || lo < 0xDC00 || lo > 0xDFFF {
+				return true
+			}
+			i += 11
+		case r >= 0xDC00 && r <= 0xDFFF:
+			return true
+		default:
+			i += 5
+		}
+	}
+	return false
 }
 
 var (

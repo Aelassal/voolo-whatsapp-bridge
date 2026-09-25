@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Signs and publishes flags.json (PROTOCOL.md §11) to the "flags" prerelease.
-# Manual only. It runs in the protected "flags" environment, so every run
-# waits for the owner's approval before the signing key is available.
+# Manual only, and only from main: the environment allows only main, the job
+# refuses any other ref, and a step checks again before the key is read, so a
+# branch can never run its own copy of this workflow or of cmd/flags-sign with
+# the key (review M5). It runs in the protected "flags" environment, so every
+# run waits for the owner's approval before the signing key is available.
 name: flags
 
 on:
@@ -25,11 +28,16 @@ concurrency:
 
 jobs:
   publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     environment: flags
     permissions:
       contents: write
     steps:
+      - name: refuse any ref but main
+        env:
+          REF: ${{ github.ref }}
+        run: test "$REF" = "refs/heads/main"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

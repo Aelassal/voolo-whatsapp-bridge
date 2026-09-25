@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/protocol"
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/store"
+	"github.com/Aelassal/voolo-whatsapp-bridge/internal/wa"
 )
 
 const key1 = "0000000000000000000000000000000000000000000000000000000000000001"
@@ -172,12 +174,14 @@ func TestBeforeInitAndGarbage(t *testing.T) {
 	}
 }
 
-func TestInitTimeoutExits2(t *testing.T) {
+// Review M1: "no init" has its own exit code, 6, which cannot be mistaken for
+// the Go runtime's crash code 2.
+func TestInitTimeoutExits6(t *testing.T) {
 	p := start(t, 200*time.Millisecond)
 	p.expect("hello")
 	p.cmd("ping", map[string]any{}) // a ping does not count as init
-	if c := p.exit(); c != 2 {
-		t.Fatalf("exit %d, want 2", c)
+	if c := p.exit(); c != 6 || wa.ExitNoInit != 6 {
+		t.Fatalf("exit %d, want 6", c)
 	}
 }
 
@@ -303,6 +307,15 @@ func TestFlags(t *testing.T) {
 	if strings.TrimSpace(out.String()) != "https://github.com/Aelassal/voolo-whatsapp-bridge/tree/v1.2.3" {
 		t.Fatalf("--source for a release: %q", out.String())
 	}
+	// Lead decision (3): versions are written and compared without a leading v.
+	version = "v1.2.3"
+	out.Reset()
+	run([]string{"--version"}, nil, &out, &errOut, defaultDeps())
+	bare := bareVersion()
+	version = old
+	if bare != "1.2.3" || strings.Contains(out.String(), "v1.2.3") || !strings.Contains(out.String(), " 1.2.3 ") {
+		t.Fatalf("--version for a tag-style version: %q, bare %q", out.String(), bare)
+	}
 	if c := run([]string{"--proxy", "x"}, nil, &out, &errOut, defaultDeps()); c != exitUsage {
 		t.Fatalf("unknown flag exit %d", c)
 	}
@@ -313,15 +326,7 @@ func TestBinaryStdinEOF(t *testing.T) {
 	if testing.Short() {
 		t.Skip("builds the binary")
 	}
-	bin := filepath.Join(t.TempDir(), "bridge")
-	if runtime.GOOS == "windows" {
-		bin += ".exe"
-	}
-	build := exec.Command("go", "build", "-trimpath", "-o", bin, ".")
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	bin := buildBinary(t)
 	cmd := exec.Command(bin)
 	cmd.Stdin = strings.NewReader("")
 	var stdout, stderr bytes.Buffer
@@ -338,4 +343,88 @@ func TestBinaryStdinEOF(t *testing.T) {
 		t.Fatalf("stdout: %q", stdout.String())
 	}
 	checkStderr(t, stderr.String())
+}
+
+// buildBinary builds the command, with optional build tags, into a temp dir.
+func buildBinary(t *testing.T, tags ...string) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "bridge")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	args := []string{"build", "-trimpath", "-o", bin}
+	if len(tags) > 0 {
+		args = append(args, "-tags", strings.Join(tags, ","))
+	}
+	build := exec.Command("go", append(args, ".")...)
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// Review L7 (mutation mut-19): anything in the process that prints to
+// os.Stdout goes to the null device, never into the protocol stream.
+func TestStdoutGuard(t *testing.T) {
+	saved := os.Stdout
+	defer func() { os.Stdout = saved }()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	out := guardStdout()
+	fmt.Println("a library print")
+	_, _ = os.Stdout.WriteString("another print\n")
+	_, _ = out.WriteString("protocol line\n")
+	w.Close()
+	got, _ := io.ReadAll(r)
+	if string(got) != "protocol line\n" {
+		t.Fatalf("protocol stream carried %q", got)
+	}
+}
+
+// Review M1: a panic in a goroutine the bridge does not own (here a probe
+// built in with -tags crashprobe) crashes the process with the Go runtime's
+// code 2, and nothing of it, not even the panic value, reaches stderr.
+func TestBinaryCrashOutputNeverReachesStderr(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("stderr isolation on Windows is compile-checked only (PROTOCOL.md known limits)")
+	}
+	bin := buildBinary(t, "crashprobe")
+	cmd := exec.Command(bin)
+	stdin, _ := cmd.StdinPipe() // kept open: the bridge waits for init
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("probe did not crash the process")
+	}
+	stdin.Close()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 2 {
+		t.Fatalf("exit: %v, want the Go runtime crash code 2", err)
+	}
+	out := stderr.String()
+	for _, s := range []string{"panic", "probe", "15550100002", "goroutine", ".go:", "9f3ab7c2e81d4f06"} {
+		if strings.Contains(out, s) {
+			t.Fatalf("stderr contains %q:\n%s", s, out)
+		}
+	}
+	checkStderr(t, out)
+	if !strings.Contains(stdout.String(), `"type":"hello"`) {
+		t.Fatalf("stdout: %q", stdout.String())
+	}
 }

@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ncruces/go-sqlite3"
@@ -43,6 +44,8 @@ var (
 	ErrKeyInvalid = errors.New("store_key_invalid")
 	ErrLocked     = errors.New("store_locked")
 	ErrNoKey      = errors.New("store key missing")
+	// ErrClosed is returned by every method after Close or Wipe.
+	ErrClosed = errors.New("store closed")
 )
 
 // IOError wraps a disk error (store_io).
@@ -57,12 +60,44 @@ const OutboxKeep = 1000
 // MediaRetention is how long media descriptors are kept.
 const MediaRetention = 90 * 24 * time.Hour
 
-// Store is an open, locked, encrypted session store.
+// Store is an open, locked, encrypted session store. Its methods are safe for
+// concurrent use, also with Close and Wipe: a method that runs while the store
+// is closed waits for it or returns ErrClosed, never touching a closed handle.
 type Store struct {
-	Dir       string
+	Dir string
+	// DB is set once by Open and never changed or cleared. Code outside this
+	// package uses the methods; DB is exported for tests and whatsmeow's
+	// Container, which shares it.
 	DB        *sql.DB
 	Container *sqlstore.Container
-	unlock    func()
+
+	mu     sync.RWMutex // held for reading by every method, for writing by Close/Wipe
+	closed bool
+	unlock func()
+}
+
+// use returns the database for one method call, or ErrClosed. The caller runs
+// done when the call is finished; until then Close and Wipe wait.
+func (s *Store) use() (db *sql.DB, done func(), err error) {
+	if s == nil {
+		return nil, nil, ErrClosed
+	}
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil, nil, ErrClosed
+	}
+	return s.DB, s.mu.RUnlock, nil
+}
+
+// Closed reports whether Close or Wipe has run.
+func (s *Store) Closed() bool {
+	if s == nil {
+		return true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.closed
 }
 
 // Open opens (or creates) the store in dir with a 32-byte key.
@@ -112,11 +147,13 @@ func open(ctx context.Context, dir string, key []byte, log waLog.Logger) (*Store
 	}
 	hexKey := hex.EncodeToString(key)
 	initConn := func(c *sqlite3.Conn) error {
-		// The key first, before anything reads the file.
+		// The key first, before anything reads the file. synchronous=FULL
+		// makes every commit, the outbox reservation above all, durable
+		// across a power loss (review L6).
 		if err := c.Exec("PRAGMA hexkey='" + hexKey + "'"); err != nil {
 			return err
 		}
-		return c.Exec("PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+		return c.Exec("PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=10000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
 	}
 	db, err := driver.Open(dsn(dbPath), initConn)
 	if err != nil {
@@ -186,17 +223,20 @@ CREATE TABLE IF NOT EXISTS voolo_chats (
 );
 `
 
-// Close closes the database and releases the lock.
+// Close closes the database and releases the lock. It waits for method calls
+// in progress; later calls return ErrClosed. A second Close does nothing.
 func (s *Store) Close() error {
 	if s == nil {
 		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var err error
-	if s.DB != nil {
+	if !s.closed {
+		s.closed = true
 		// Fold the WAL back into the main file before closing.
 		_, _ = s.DB.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 		err = s.Container.Close()
-		s.DB = nil
 	}
 	if s.unlock != nil {
 		s.unlock()
@@ -207,9 +247,11 @@ func (s *Store) Close() error {
 
 // Wipe closes the store and deletes its files (the lock file stays, unlocked).
 func (s *Store) Wipe() error {
-	if s.DB != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.closed {
+		s.closed = true
 		_ = s.Container.Close()
-		s.DB = nil
 	}
 	var firstErr error
 	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
@@ -227,14 +269,19 @@ func (s *Store) Wipe() error {
 // ReserveOutbox records an outbox id before its send. It returns dup=true,
 // and records nothing, if the id is already among the remembered ones.
 func (s *Store) ReserveOutbox(ctx context.Context, outboxID string, now time.Time) (dup bool, err error) {
-	res, err := s.DB.ExecContext(ctx, `INSERT INTO voolo_sent (outbox_id, created_at) VALUES ($1, $2) ON CONFLICT (outbox_id) DO NOTHING`, outboxID, now.UnixMilli())
+	db, done, err := s.use()
+	if err != nil {
+		return false, err
+	}
+	defer done()
+	res, err := db.ExecContext(ctx, `INSERT INTO voolo_sent (outbox_id, created_at) VALUES ($1, $2) ON CONFLICT (outbox_id) DO NOTHING`, outboxID, now.UnixMilli())
 	if err != nil {
 		return false, &IOError{err}
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return true, nil
 	}
-	_, err = s.DB.ExecContext(ctx, `DELETE FROM voolo_sent WHERE outbox_id NOT IN (SELECT outbox_id FROM voolo_sent ORDER BY created_at DESC, rowid DESC LIMIT $1)`, OutboxKeep)
+	_, err = db.ExecContext(ctx, `DELETE FROM voolo_sent WHERE outbox_id NOT IN (SELECT outbox_id FROM voolo_sent ORDER BY created_at DESC, rowid DESC LIMIT $1)`, OutboxKeep)
 	if err != nil {
 		return false, &IOError{err}
 	}
@@ -243,7 +290,12 @@ func (s *Store) ReserveOutbox(ctx context.Context, outboxID string, now time.Tim
 
 // SetOutboxMessage stores the WhatsApp message id of a sent outbox id.
 func (s *Store) SetOutboxMessage(ctx context.Context, outboxID, messageID string) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE voolo_sent SET message_id=$1 WHERE outbox_id=$2`, messageID, outboxID)
+	db, done, err := s.use()
+	if err != nil {
+		return err
+	}
+	defer done()
+	_, err = db.ExecContext(ctx, `UPDATE voolo_sent SET message_id=$1 WHERE outbox_id=$2`, messageID, outboxID)
 	if err != nil {
 		return &IOError{err}
 	}
@@ -267,10 +319,15 @@ type MediaDesc struct {
 
 // PutMedia upserts media descriptors in one transaction.
 func (s *Store) PutMedia(ctx context.Context, ds []MediaDesc) error {
+	db, done, err := s.use()
+	if err != nil {
+		return err
+	}
+	defer done()
 	if len(ds) == 0 {
 		return nil
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return &IOError{err}
 	}
@@ -304,14 +361,19 @@ func scanMedia(sc interface{ Scan(...any) error }) (d MediaDesc, err error) {
 // since merged into its phone-number JID), a message id that is stored in
 // exactly one chat is found anyway; an ambiguous id is not guessed.
 func (s *Store) GetMedia(ctx context.Context, chatJID, messageID string) (d MediaDesc, ok bool, err error) {
-	d, err = scanMedia(s.DB.QueryRowContext(ctx, `SELECT `+mediaCols+` FROM voolo_media WHERE chat_jid=$1 AND message_id=$2`, chatJID, messageID))
+	db, done, err := s.use()
+	if err != nil {
+		return d, false, err
+	}
+	defer done()
+	d, err = scanMedia(db.QueryRowContext(ctx, `SELECT `+mediaCols+` FROM voolo_media WHERE chat_jid=$1 AND message_id=$2`, chatJID, messageID))
 	if err == nil {
 		return d, true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return d, false, &IOError{err}
 	}
-	rows, err := s.DB.QueryContext(ctx, `SELECT `+mediaCols+` FROM voolo_media WHERE message_id=$1 LIMIT 2`, messageID)
+	rows, err := db.QueryContext(ctx, `SELECT `+mediaCols+` FROM voolo_media WHERE message_id=$1 LIMIT 2`, messageID)
 	if err != nil {
 		return d, false, &IOError{err}
 	}
@@ -332,7 +394,12 @@ func (s *Store) GetMedia(ctx context.Context, chatJID, messageID string) (d Medi
 
 // PruneMedia deletes descriptors of messages older than the retention.
 func (s *Store) PruneMedia(ctx context.Context, now time.Time) (int64, error) {
-	res, err := s.DB.ExecContext(ctx, `DELETE FROM voolo_media WHERE msg_ts < $1`, now.Add(-MediaRetention).UnixMilli())
+	db, done, err := s.use()
+	if err != nil {
+		return 0, err
+	}
+	defer done()
+	res, err := db.ExecContext(ctx, `DELETE FROM voolo_media WHERE msg_ts < $1`, now.Add(-MediaRetention).UnixMilli())
 	if err != nil {
 		return 0, &IOError{err}
 	}
@@ -343,10 +410,15 @@ func (s *Store) PruneMedia(ctx context.Context, now time.Time) (int64, error) {
 // AddChats records reported chat JIDs. lidPending marks @lid chats whose
 // phone-number JID is not known yet.
 func (s *Store) AddChats(ctx context.Context, jids []string) error {
+	db, done, err := s.use()
+	if err != nil {
+		return err
+	}
+	defer done()
 	if len(jids) == 0 {
 		return nil
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return &IOError{err}
 	}
@@ -369,7 +441,12 @@ func (s *Store) AddChats(ctx context.Context, jids []string) error {
 // Chats returns every reported chat JID and whether it is a @lid chat waiting
 // for its phone-number alias.
 func (s *Store) Chats(ctx context.Context) (map[string]bool, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT jid, lid_alias_pending FROM voolo_chats`)
+	db, done, err := s.use()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	rows, err := db.QueryContext(ctx, `SELECT jid, lid_alias_pending FROM voolo_chats`)
 	if err != nil {
 		return nil, &IOError{err}
 	}
@@ -388,7 +465,12 @@ func (s *Store) Chats(ctx context.Context) (map[string]bool, error) {
 
 // ResolveLIDChat marks a reported @lid chat as aliased to pn (and records pn).
 func (s *Store) ResolveLIDChat(ctx context.Context, lid, pn string) error {
-	tx, err := s.DB.BeginTx(ctx, nil)
+	db, done, err := s.use()
+	if err != nil {
+		return err
+	}
+	defer done()
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return &IOError{err}
 	}
@@ -405,5 +487,52 @@ func (s *Store) ResolveLIDChat(ctx context.Context, lid, pn string) error {
 	return nil
 }
 
+// OutboxKnown reports whether an outbox id is among the remembered ones,
+// without reserving it.
+func (s *Store) OutboxKnown(ctx context.Context, outboxID string) (bool, error) {
+	db, done, err := s.use()
+	if err != nil {
+		return false, err
+	}
+	defer done()
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM voolo_sent WHERE outbox_id=$1`, outboxID).Scan(&n); err != nil {
+		return false, &IOError{err}
+	}
+	return n > 0, nil
+}
+
+// RecentSends returns the reservation times of the sends made after since
+// (newest last), for the send backstop across restarts.
+func (s *Store) RecentSends(ctx context.Context, since time.Time) ([]time.Time, error) {
+	db, done, err := s.use()
+	if err != nil {
+		return nil, err
+	}
+	defer done()
+	rows, err := db.QueryContext(ctx, `SELECT created_at FROM voolo_sent WHERE created_at > $1 ORDER BY created_at, rowid`, since.UnixMilli())
+	if err != nil {
+		return nil, &IOError{err}
+	}
+	defer rows.Close()
+	var out []time.Time
+	for rows.Next() {
+		var ms int64
+		if err := rows.Scan(&ms); err != nil {
+			return nil, &IOError{err}
+		}
+		out = append(out, time.UnixMilli(ms))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, &IOError{err}
+	}
+	return out, nil
+}
+
 // String never reveals the path (for accidental %v use).
-func (s *Store) String() string { return fmt.Sprintf("store(open=%v)", s != nil && s.DB != nil) }
+func (s *Store) String() string { return fmt.Sprintf("store(open=%v)", !s.Closed()) }
+
+// RestrictDir makes an existing folder owner-only (0700) on macOS and Linux.
+// On Windows it does nothing: folders inherit the user profile's ACL
+// (PROTOCOL.md §10.1 and known limits).
+func RestrictDir(path string) error { return restrictMode(path, true) }

@@ -92,12 +92,14 @@ func (c realClient) Contact(ctx context.Context, jid types.JID) types.ContactInf
 }
 
 // NewRealClient builds a whatsmeow client on a device store. Every HTTP client
-// (pre-login and logged-in websocket, media) is the allowlisted one.
-func NewRealClient(device *store.Device, httpClient *http.Client, log waLog.Logger) Client {
+// (pre-login and logged-in websocket, media) goes through the allowlisted
+// transport; the media client also applies the download body limit
+// (transport.NewMediaClient).
+func NewRealClient(device *store.Device, httpClient, mediaClient *http.Client, log waLog.Logger) Client {
 	cli := whatsmeow.NewClient(device, log)
 	cli.SetPreLoginHTTPClient(httpClient)
 	cli.SetWebsocketHTTPClient(httpClient)
-	cli.SetMediaHTTPClient(httpClient)
+	cli.SetMediaHTTPClient(mediaClient)
 	cli.ManualHistorySyncDownload = true // the bridge downloads at the pace of the ack window
 	cli.EnableAutoReconnect = true
 	cli.InitialAutoReconnect = true

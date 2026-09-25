@@ -194,3 +194,51 @@ func TestOggDuration(t *testing.T) {
 		t.Fatal("non-ogg")
 	}
 }
+
+// Review L4: the file checked is the file read. A path swapped for a link to
+// another valid hand-off file after the check is refused, and a file truncated
+// after the check gives media_invalid, not a panic.
+func TestOpenChecksTheHandleItReads(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	dir := t.TempDir()
+	target, _ := Seal(dir, plaintext)
+	path := filepath.Join(dir, "0123456789abcdef0123456789abcde0.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{7}, 200), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterCheck = func(p string) {
+		_ = os.Remove(p)
+		_ = os.Symlink(target.Path, p)
+	}
+	defer func() { testHookAfterCheck = nil }()
+	if _, err := Open(dir, path, target.Key, target.SHA256, 1<<20); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("swapped link: want ErrInvalid, got %v", err)
+	}
+
+	s, _ := Seal(dir, plaintext)
+	testHookAfterCheck = func(p string) { _ = os.Truncate(p, 5) }
+	if _, err := Open(dir, s.Path, s.Key, s.SHA256, 1<<20); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("truncated: want ErrInvalid, got %v", err)
+	}
+	if _, err := os.Stat(s.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("truncated file not deleted")
+	}
+}
+
+// Review L4: Discard deletes a hand-off file named in a refused send_media,
+// and nothing outside the media folder.
+func TestDiscard(t *testing.T) {
+	dir, other := t.TempDir(), t.TempDir()
+	in, _ := Seal(dir, plaintext)
+	out, _ := Seal(other, plaintext)
+	Discard(dir, in.Path)
+	Discard(dir, out.Path)
+	if _, err := os.Stat(in.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("hand-off file kept")
+	}
+	if _, err := os.Stat(out.Path); err != nil {
+		t.Fatal("file outside the media folder deleted")
+	}
+}

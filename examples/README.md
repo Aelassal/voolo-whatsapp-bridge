@@ -23,6 +23,8 @@ One message per file, exactly as it travels on the wire: a single JSON line endi
 | `init-short-key.json` | bridge: `bad_request` (the key is 64 hex characters) |
 | `init-limits-above-ceiling.json` | bridge: `bad_request` (limits cannot exceed the ceilings) |
 | `mark_read-too-many.json` | bridge: `bad_request` (at most 50 ids) |
+| `send_text-lone-surrogate.json` | bridge: `bad_request` (text must be valid UTF-8; a lone surrogate escape is not) |
+| `ulid-overflow.json` | either side: dropped (a ULID starts with `0`–`7`) |
 | `wrong-version.json` | either side: not processed (`v` is not 1) |
 | `extra-envelope-field.json` | either side: dropped (the envelope has exactly five fields) |
 | `media_ready-path-traversal.json` | client: refuse (the path leaves `mediaDir`) |

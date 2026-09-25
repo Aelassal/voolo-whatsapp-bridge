@@ -339,3 +339,88 @@ func TestChatsAndLIDResolution(t *testing.T) {
 }
 
 var _ = sql.ErrNoRows
+
+// Review L6: the outbox reservation survives a power loss (synchronous=FULL on
+// every connection, WAL mode).
+func TestSynchronousFull(t *testing.T) {
+	s, err := Open(context.Background(), t.TempDir(), key(12), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	conns := make([]*sql.Conn, 3) // several pooled connections, each set up by the hook
+	for i := range conns {
+		c, err := s.DB.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns[i] = c
+		var sync int
+		if err := c.QueryRowContext(context.Background(), "PRAGMA synchronous").Scan(&sync); err != nil || sync != 2 {
+			t.Fatalf("connection %d: synchronous=%d err=%v, want 2 (FULL)", i, sync, err)
+		}
+	}
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
+// Review H1: every store method is safe after Close and Wipe, including while
+// other goroutines are using the store: they get ErrClosed, never a panic.
+func TestMethodsAfterCloseAndWipe(t *testing.T) {
+	ctx := context.Background()
+	for _, end := range []string{"close", "wipe"} {
+		s, err := Open(ctx, t.TempDir(), key(13), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = s.AddChats(ctx, []string{"15550100002@s.whatsapp.net"})
+				_, _, _ = s.GetMedia(ctx, "15550100002@s.whatsapp.net", "X")
+			}
+		}()
+		time.Sleep(20 * time.Millisecond)
+		if end == "close" {
+			err = s.Close()
+		} else {
+			err = s.Wipe()
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		close(stop)
+		<-done
+		if !s.Closed() {
+			t.Fatal("Closed() false")
+		}
+		checks := map[string]error{}
+		_, checks["ReserveOutbox"] = s.ReserveOutbox(ctx, "01M3C03V80N87VFZS5G0J0NFEX", time.Now())
+		checks["SetOutboxMessage"] = s.SetOutboxMessage(ctx, "01M3C03V80N87VFZS5G0J0NFEX", "3EB0")
+		checks["PutMedia"] = s.PutMedia(ctx, []MediaDesc{{ChatJID: "a", MessageID: "b"}})
+		_, _, checks["GetMedia"] = s.GetMedia(ctx, "a", "b")
+		_, checks["PruneMedia"] = s.PruneMedia(ctx, time.Now())
+		checks["AddChats"] = s.AddChats(ctx, []string{"a"})
+		_, checks["Chats"] = s.Chats(ctx)
+		checks["ResolveLIDChat"] = s.ResolveLIDChat(ctx, "a", "b")
+		_, checks["RecentSends"] = s.RecentSends(ctx, time.Now().Add(-time.Hour))
+		_, checks["OutboxKnown"] = s.OutboxKnown(ctx, "01M3C03V80N87VFZS5G0J0NFEX")
+		for name, err := range checks {
+			if !errors.Is(err, ErrClosed) {
+				t.Errorf("%s after %s: %v", name, end, err)
+			}
+		}
+		if err := s.Close(); err != nil {
+			t.Errorf("second Close after %s: %v", end, err)
+		}
+	}
+}

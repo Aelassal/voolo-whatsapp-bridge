@@ -4,17 +4,20 @@
 // Package logx writes content-free diagnostics to stderr (PROTOCOL.md §10.4).
 //
 // Every line is a JSON object {"t","level","event","code"?,"n"?}. Event names
-// and codes are fixed strings chosen by this program; anything that could carry
-// user content (message text, names, phone numbers, JIDs, QR strings, pairing
-// codes, keys, paths) is never passed in. As a second line of defence, codes are
-// scrubbed: characters outside a small set are removed, and a code that looks
-// like it holds an address or a number sequence is replaced by "redacted".
+// come from a fixed list (Events, PROTOCOL.md §10.4); any other name is
+// written as "invalid_event". Codes are fixed strings chosen by this program;
+// anything that could carry user content (message text, names, phone numbers,
+// JIDs, QR strings, pairing codes, keys, paths) is never passed in. As a second
+// line of defence, codes are scrubbed: characters outside a small set are
+// removed, and a code that looks like it holds an address, a number sequence,
+// a hex or base64 run (a key, a hash, an id) is replaced by "redacted".
 package logx
 
 import (
 	"encoding/json"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -56,13 +59,85 @@ type line struct {
 	N     *int64 `json:"n,omitempty"`
 }
 
-var eventRe = regexp.MustCompile(`^[a-z][a-z0-9_.]{0,63}$`)
+// events is the complete list of event names (PROTOCOL.md §10.4). It is a
+// constant of the program: a name built at run time is never written.
+var events = map[string]bool{}
+
+func init() {
+	for _, e := range []string{
+		// process and stdio
+		"started", "stdin_eof", "shutdown", "init_timeout", "line_dropped", "emit_failed", "panic", "panic_recovered",
+		"stop_timeout", "exit_logged_out",
+		// init and store
+		"ready", "fatal", "store_open_failed", "store_close_failed", "store_wiped", "store_wipe_failed", "store_write_failed",
+		"media_prune_failed", "media_stale_deleted",
+		// commands and connection
+		"command_refused", "status", "signal", "connect_failed", "host_blocked", "logged_out",
+		"pairing_started", "pairing_failed", "pairing_timeout", "paired",
+		"version_refreshed", "version_refresh_failed",
+		"send_ok", "send_failed", "send_refused", "fetch_failed",
+		"group_info_failed", "joined_groups_failed",
+		"history_capped", "history_done", "history_download_failed",
+		// whatsmeow's own warnings and errors (constant format string as code)
+		"whatsmeow",
+	} {
+		events[e] = true
+	}
+}
+
+// Events returns the fixed event names, for documentation and tests.
+func Events() []string {
+	out := make([]string, 0, len(events))
+	for e := range events {
+		out = append(out, e)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // Opt adds an optional field to a line.
 type Opt func(*line)
 
-// Code attaches a fixed code (an error code, a state, a constant format string).
-func Code(c string) Opt { return func(l *line) { l.Code = ScrubCode(c) } }
+// codes is the complete list of values Code may write: this package's own
+// words plus the protocol's codes, registered by AllowCodes at start-up.
+var (
+	codesMu sync.RWMutex
+	codes   = map[string]bool{
+		"too_long": true, "invalid": true, "event": true, "history": true, "command": true,
+		"alias": true, "chats": true, "media": true, "outbox": true, "phone": true, "qr": true, "async": true,
+	}
+)
+
+// AllowCodes adds fixed codes (constants of the program, registered from
+// package init functions).
+func AllowCodes(cs ...string) {
+	codesMu.Lock()
+	defer codesMu.Unlock()
+	for _, c := range cs {
+		codes[c] = true
+	}
+}
+
+// Code attaches a fixed code chosen by this program: an error code, a state,
+// a signal kind, a command or event type, a short word. A value that is not
+// one of the registered codes is written as "redacted", so a key, a hash, an
+// id, a JID or a phone number passed as a code by mistake never appears.
+func Code(c string) Opt {
+	codesMu.RLock()
+	ok := codes[c]
+	codesMu.RUnlock()
+	return func(l *line) {
+		if ok {
+			l.Code = c
+		} else {
+			l.Code = "redacted"
+		}
+	}
+}
+
+// Format attaches a constant format string of whatsmeow's logger, scrubbed by
+// ScrubCode. Its arguments are never passed in.
+func Format(f string) Opt { return func(l *line) { l.Code = ScrubCode(f) } }
 
 // N attaches a count.
 func N(n int64) Opt { return func(l *line) { v := n; l.N = &v } }
@@ -72,7 +147,7 @@ func (l *Logger) Log(level Level, event string, opts ...Opt) {
 	if l == nil {
 		return
 	}
-	if !eventRe.MatchString(event) {
+	if !events[event] {
 		event = "invalid_event"
 	}
 	ln := line{T: l.now().UnixMilli(), Level: level, Event: event}
@@ -102,18 +177,39 @@ const maxCode = 160
 
 var (
 	digitRun = regexp.MustCompile(`[0-9]{5,}`)
+	hexRun   = regexp.MustCompile(`[0-9A-Fa-f]{16,}`)
+	tokenRun = regexp.MustCompile(`[A-Za-z0-9/_=-]{16,}`)
 	codeKeep = regexp.MustCompile(`[^A-Za-z0-9 _.:/%,()'\-]`)
 )
 
+// secretLike reports whether s holds something that could be a key, a hash,
+// an id or an address: '@', '+', a run of five or more digits, a run of 16 or
+// more hex digits, or a run of 16 or more base64 characters with a digit in
+// it or with both upper and lower case letters.
+func secretLike(s string) bool {
+	if strings.ContainsAny(s, "@+") || digitRun.MatchString(s) || hexRun.MatchString(s) {
+		return true
+	}
+	for _, t := range tokenRun.FindAllString(s, -1) {
+		if strings.ContainsAny(t, "0123456789") || (strings.ToLower(t) != t && strings.ToUpper(t) != t) {
+			return true
+		}
+	}
+	return false
+}
+
 // ScrubCode reduces s to a safe diagnostic code. It keeps letters, digits and a
 // few punctuation marks, caps the length, and replaces the whole value with
-// "redacted" when it contains '@', '+' followed by digits, or a run of five or
-// more digits (a phone number, a JID or an id could hide there).
+// "redacted" when it looks like it holds a secret or an address (secretLike),
+// before or after the other characters are removed.
 func ScrubCode(s string) string {
-	if strings.ContainsAny(s, "@+") || digitRun.MatchString(s) {
+	if secretLike(s) {
 		return "redacted"
 	}
 	s = codeKeep.ReplaceAllString(s, "")
+	if secretLike(s) {
+		return "redacted"
+	}
 	if len(s) > maxCode {
 		s = s[:maxCode]
 	}

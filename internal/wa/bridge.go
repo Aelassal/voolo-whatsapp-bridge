@@ -22,14 +22,16 @@ import (
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/store"
 )
 
-// Exit codes (PROTOCOL.md §9).
+// Exit codes (PROTOCOL.md §9). 2 is never used by the bridge: it is the Go
+// runtime's code for an unrecovered panic or a fatal runtime error (review M1).
 const (
 	ExitOK             = 0
-	ExitCrash          = 1
-	ExitNoInit         = 2
+	ExitCrash          = 1 // a panic recovered on the main goroutine
 	ExitStoreKey       = 3
 	ExitStoreLocked    = 4
 	ExitClientOutdated = 5
+	ExitNoInit         = 6
+	ExitLoggedOut      = 7 // after logout or a remote logout: the store is deleted
 )
 
 // Config wires the bridge to its outside world. Tests replace OpenStore,
@@ -106,15 +108,16 @@ type Bridge struct {
 	cfg   Config
 	fatal chan int
 
-	mu       sync.Mutex
-	inited   bool
-	init     protocol.Init
-	key      []byte
-	sess     *session
-	state    string
-	pair     *pairing
-	stopped  bool
-	outdated int // ClientOutdated events seen
+	mu        sync.Mutex
+	inited    bool
+	init      protocol.Init
+	sess      *session
+	state     string
+	pair      *pairing
+	stopped   bool
+	outdated  int         // ClientOutdated events seen
+	loggedOut *logoutInfo // set once the account is unlinked; Stop wipes the store
+	sends     []time.Time // reservation times of recent sends, oldest first (send backstop)
 
 	sending  atomic.Bool
 	fetchSem chan struct{}
@@ -149,7 +152,8 @@ func New(cfg Config) *Bridge {
 	}
 }
 
-// Fatal delivers the exit code after a fatal error event has been written.
+// Fatal delivers an exit code: after a fatal error event has been written, or
+// after a logout (ExitLoggedOut). The caller then calls Stop and exits.
 func (b *Bridge) Fatal() <-chan int { return b.fatal }
 
 // Initialized reports whether init succeeded.
@@ -174,8 +178,13 @@ func (b *Bridge) failFatal(replyTo, code string, exit int) {
 	e.Fatal = true
 	b.emit(protocol.EvError, e)
 	b.cfg.Log.Error("fatal", logx.Code(code))
+	b.exit(exit)
+}
+
+// exit asks the caller to Stop the bridge and exit with code (the first request wins).
+func (b *Bridge) exit(code int) {
 	select {
-	case b.fatal <- exit:
+	case b.fatal <- code:
 	default:
 	}
 }
@@ -240,13 +249,13 @@ func (b *Bridge) Handle(env protocol.Envelope) (shutdown bool) {
 	case *protocol.PairPhone:
 		b.startPairing(id, c.Phone)
 	case *protocol.SendText:
-		b.async(func() { b.sendText(id, c) })
+		b.asyncCmd(id, func() { b.sendText(id, c) })
 	case *protocol.SendMedia:
-		b.async(func() { b.sendMedia(id, c) })
+		b.asyncCmd(id, func() { b.sendMedia(id, c) })
 	case *protocol.MarkRead:
-		b.async(func() { b.markRead(id, c) })
+		b.asyncCmd(id, func() { b.markRead(id, c) })
 	case *protocol.FetchMedia:
-		b.async(func() { b.fetchMedia(id, c) })
+		b.asyncCmd(id, func() { b.fetchMedia(id, c) })
 	case *protocol.Empty:
 		switch env.Type {
 		case protocol.CmdPing:
@@ -256,19 +265,39 @@ func (b *Bridge) Handle(env protocol.Envelope) (shutdown bool) {
 		case protocol.CmdPairQR:
 			b.startPairing(id, "")
 		case protocol.CmdLogout:
-			b.async(func() { b.logout(id) })
+			b.asyncCmd(id, func() { b.logout(id) })
 		}
 	}
 	return false
 }
 
-func (b *Bridge) async(f func()) {
-	b.wg.Add(1)
+// async runs f on a goroutine that Stop waits for. After Stop has begun it
+// runs nothing. A panic in f is recovered and reported on stderr with a
+// constant code only: the panic value, which could hold content, is dropped.
+func (b *Bridge) async(f func()) { b.goSafe("async", nil, f) }
+
+// asyncCmd is async for a command: a panic also gets the command its final
+// reply, error{internal}.
+func (b *Bridge) asyncCmd(id string, f func()) {
+	b.goSafe("command", func() { b.fail(id, protocol.ErrInternal) }, f)
+}
+
+func (b *Bridge) goSafe(where string, onPanic func(), f func()) {
+	b.mu.Lock()
+	if b.stopped {
+		b.mu.Unlock()
+		return
+	}
+	b.wg.Add(1) // under mu, so never concurrent with Stop's Wait
+	b.mu.Unlock()
 	go func() {
 		defer b.wg.Done()
 		defer func() {
 			if r := recover(); r != nil {
-				b.cfg.Log.Error("panic_recovered")
+				b.cfg.Log.Error("panic_recovered", logx.Code(where))
+				if onPanic != nil {
+					onPanic()
+				}
 			}
 		}()
 		f()
@@ -284,7 +313,13 @@ func (b *Bridge) doInit(id string, c *protocol.Init) {
 	}
 	b.mu.Unlock()
 	key, _ := hex.DecodeString(c.StoreKey) // validated: 64 lowercase hex
+	defer clear(key)
 	if err := os.MkdirAll(c.MediaDir, 0o700); err != nil {
+		b.fail(id, protocol.ErrStoreIO)
+		return
+	}
+	// An existing folder is tightened too (review L5).
+	if err := store.RestrictDir(c.MediaDir); err != nil {
 		b.fail(id, protocol.ErrStoreIO)
 		return
 	}
@@ -304,9 +339,14 @@ func (b *Bridge) doInit(id string, c *protocol.Init) {
 		return
 	}
 	b.cfg.ConfigureDevice(c.DeviceName, c.Limits.HistoryDays)
+	recent, err := st.RecentSends(ctx, b.cfg.Now().Add(-SendWindow))
+	if err != nil {
+		b.cfg.Log.Warn("store_write_failed", logx.Code("outbox"))
+	}
 	b.mu.Lock()
 	b.init = *c
-	b.key = key
+	b.init.StoreKey = "" // the key stays only in the open store's connection hook
+	b.sends = recent
 	b.caps = &history.Caps{Days: c.Limits.HistoryDays, MaxPerChat: c.Limits.HistoryMaxPerChat, Now: b.cfg.Now}
 	b.lim = media.Limits{ImageMaxBytes: c.Limits.ImageMaxBytes, VoiceMaxSeconds: c.Limits.VoiceMaxSeconds, VoiceMaxBytes: c.Limits.VoiceBytes(), FileMaxBytes: protocol.MaxFileBytes}
 	b.mu.Unlock()
@@ -360,11 +400,7 @@ func (b *Bridge) install(st *store.Store) (*session, error) {
 	b.groupCache = map[string]*types.GroupInfo{}
 	b.groupsLoaded = false
 	b.mu.Unlock()
-	b.wg.Add(1)
-	go func() {
-		defer b.wg.Done()
-		b.historyLoop(s)
-	}()
+	b.goSafe("history", nil, func() { b.historyLoop(s) })
 	return s, nil
 }
 
@@ -380,18 +416,21 @@ func (b *Bridge) connect(s *session) {
 	})
 }
 
-// Stop disconnects, closes the store and reports "stopped". It is used for
-// shutdown and stdin EOF, and returns within a few hundred milliseconds.
+// Stop ends the bridge: it cancels every running operation, disconnects,
+// waits for the bridge's goroutines, and only then closes the store (or, after
+// a logout, deletes it). It is used for shutdown, stdin EOF, fatal errors and
+// logouts, and returns within about two seconds.
 func (b *Bridge) Stop() {
 	b.mu.Lock()
 	if b.stopped {
 		b.mu.Unlock()
 		return
 	}
-	b.stopped = true
+	b.stopped = true // from now on goSafe starts nothing
 	s := b.sess
 	p := b.pair
 	b.pair = nil
+	lo := b.loggedOut
 	b.mu.Unlock()
 	if p != nil {
 		p.cancel()
@@ -399,62 +438,67 @@ func (b *Bridge) Stop() {
 	if s != nil {
 		s.cancel()
 		s.cli.Disconnect()
-		if err := s.st.Close(); err != nil {
+	}
+	done := make(chan struct{})
+	go func() {
+		defer func() { _ = recover() }()
+		b.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(1500 * time.Millisecond):
+		// A goroutine still runs; the store refuses its later calls (ErrClosed).
+		b.cfg.Log.Warn("stop_timeout")
+	}
+	if s != nil {
+		if lo != nil {
+			if err := s.st.Wipe(); err != nil {
+				b.cfg.Log.Error("store_wipe_failed")
+				b.fail("", protocol.ErrStoreIO)
+			} else {
+				b.cfg.Log.Info("store_wiped")
+			}
+			b.emit(protocol.EvLoggedOut, protocol.LoggedOut{Reason: lo.reason, Code: lo.code})
+		} else if err := s.st.Close(); err != nil {
 			b.cfg.Log.Warn("store_close_failed")
 		}
 	}
 	if b.Initialized() {
 		b.setState(protocol.StateStopped)
 	}
-	done := make(chan struct{})
-	go func() { b.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(1500 * time.Millisecond):
-		b.cfg.Log.Warn("stop_timeout")
+	if lo != nil && lo.replyTo != "" {
+		b.emit(protocol.EvOK, protocol.Reply{ReplyTo: lo.replyTo})
 	}
 }
 
-// resetAfterLogout wipes the store, opens a fresh one with the same key and a
-// new client, and reports the logout. Synced chats are the client's business.
-func (b *Bridge) resetAfterLogout(old *session, reason string, code int) {
+type logoutInfo struct {
+	reason  string
+	code    int
+	replyTo string // the logout command, if the client asked
+}
+
+// loggedOutBy records that the account behind old is no longer linked and
+// asks the caller to exit with ExitLoggedOut. The session stops at once; Stop
+// deletes the store after every goroutine has finished, then reports
+// logged_out, status stopped and, for the logout command, ok. The bridge never
+// opens a new store with the same key: the client restarts it with a new key
+// (PROTOCOL.md §6.4, review M3).
+func (b *Bridge) loggedOutBy(old *session, reason string, code int, replyTo string) {
 	b.mu.Lock()
-	if b.sess != old || b.stopped {
+	if b.sess != old || b.stopped || b.loggedOut != nil {
 		b.mu.Unlock()
 		return
 	}
+	b.loggedOut = &logoutInfo{reason: reason, code: code, replyTo: replyTo}
 	p := b.pair
 	b.pair = nil
-	init := b.init
-	key := b.key
 	b.mu.Unlock()
 	if p != nil {
 		p.cancel()
 	}
 	old.cancel()
 	old.cli.Disconnect()
-	if err := old.st.Wipe(); err != nil {
-		b.cfg.Log.Error("store_wipe_failed")
-	}
-	b.cfg.Log.Info("store_wiped")
-	b.emit(protocol.EvLoggedOut, protocol.LoggedOut{Reason: reason, Code: code})
-	b.setState(protocol.StateStopped)
-	b.window.Reset()
-	b.mu.Lock()
-	b.caps = &history.Caps{Days: init.Limits.HistoryDays, MaxPerChat: init.Limits.HistoryMaxPerChat, Now: b.cfg.Now}
-	b.mu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-	defer cancel()
-	st, err := b.cfg.OpenStore(ctx, init.StoreDir, key)
-	if err != nil {
-		b.cfg.Log.Error("store_reopen_failed")
-		b.fail("", protocol.ErrStoreIO)
-		return
-	}
-	if _, err := b.install(st); err != nil {
-		st.Close()
-		b.fail("", protocol.ErrStoreIO)
-		return
-	}
-	b.setState(protocol.StateUnpaired)
+	b.cfg.Log.Info("exit_logged_out")
+	b.exit(ExitLoggedOut)
 }
