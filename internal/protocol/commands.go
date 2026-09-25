@@ -5,6 +5,7 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -148,14 +149,34 @@ type SendMedia struct {
 	DurationS int `json:"durationS,omitempty"`
 	Width     int `json:"width,omitempty"`
 	Height    int `json:"height,omitempty"`
-	// Waveform is a voice note's 64 loudness bars, 0–100 each (revision 2,
-	// feature voice_waveform); WhatsApp's apps draw it on the voice note.
-	Waveform []int `json:"waveform,omitempty"`
+	// Waveform is a voice note's 64 loudness bars, 0–100 each, as 128 hex
+	// characters (revision 2, feature voice_waveform; a string, so a send
+	// carries no list of anything). WhatsApp's apps draw it on the voice note.
+	Waveform string `json:"waveform,omitempty"`
 	Quote
 }
 
-// WaveformBars is the length of send_media.waveform.
+// WaveformBars is the number of bars in send_media.waveform.
 const WaveformBars = 64
+
+var waveformRe = regexp.MustCompile(`^[0-9a-f]{128}$`)
+
+// WaveformBytes decodes a valid waveform (nil when absent or invalid).
+func WaveformBytes(s string) []byte {
+	if !waveformRe.MatchString(s) {
+		return nil
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil
+	}
+	for _, v := range b {
+		if v > 100 {
+			return nil
+		}
+	}
+	return b
+}
 
 // MarkRead is the mark_read payload.
 type MarkRead struct {
@@ -483,15 +504,8 @@ func validate(v any) error {
 		if c.Kind != "video" && (c.DurationS != 0 || c.Width != 0 || c.Height != 0) {
 			return bad("durationS, width and height are for a video")
 		}
-		if c.Waveform != nil {
-			if c.Kind != "voice" || len(c.Waveform) != WaveformBars {
-				return bad("waveform")
-			}
-			for _, v := range c.Waveform {
-				if v < 0 || v > 100 {
-					return bad("waveform")
-				}
-			}
+		if c.Waveform != "" && (c.Kind != "voice" || WaveformBytes(c.Waveform) == nil) {
+			return bad("waveform")
 		}
 		if c.DurationS < 0 || c.DurationS > MaxVideoSeconds || c.Width < 0 || c.Width > MaxVideoSide || c.Height < 0 || c.Height > MaxVideoSide {
 			return bad("video facts")

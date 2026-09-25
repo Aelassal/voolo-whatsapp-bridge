@@ -9,10 +9,12 @@ import (
 	"crypto/cipher"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -316,12 +318,12 @@ func TestVoiceWaveform(t *testing.T) {
 	f := h.initPairedConnected()
 	h.knownChat(f)
 	s := sealForTest(t, h.mediaDir, oggStream(7))
-	wf := make([]int, 64)
-	for i := range wf {
-		wf[i] = i % 101
+	var wf strings.Builder
+	for i := range 64 {
+		fmt.Fprintf(&wf, "%02x", i)
 	}
 	h.cmd("send_media", map[string]any{"chatJid": alice, "outboxId": "01M3C03V80N87VFZS5G0J0NFEX", "kind": "voice", "path": s.path,
-		"key": s.key, "sha256": s.sha, "mime": "audio/ogg; codecs=opus", "waveform": wf})
+		"key": s.key, "sha256": s.sha, "mime": "audio/ogg; codecs=opus", "waveform": wf.String()})
 	h.expect(protocol.EvSendResult)
 	am := f.sent[0].msg.GetAudioMessage()
 	if !am.GetPTT() || am.GetSeconds() != 7 || len(am.GetWaveform()) != 64 || am.GetWaveform()[63] != 63 {
