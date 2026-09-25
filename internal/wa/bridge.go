@@ -164,7 +164,19 @@ func (b *Bridge) Initialized() bool {
 }
 
 func (b *Bridge) emit(typ string, payload any) {
-	if err := b.cfg.Out.Emit(typ, payload); err != nil {
+	err := b.cfg.Out.Emit(typ, payload)
+	switch {
+	case errors.Is(err, protocol.ErrQuiesced):
+		// Stop has begun: only its own final lines are written (review R-M1).
+		b.cfg.Log.Warn("emit_dropped", logx.Code(typ), logx.N(b.cfg.Out.Dropped()))
+	case err != nil:
+		b.cfg.Log.Error("emit_failed", logx.Code(typ))
+	}
+}
+
+// emitFinal writes one of Stop's own last lines, which pass the quiesced writer.
+func (b *Bridge) emitFinal(typ string, payload any) {
+	if err := b.cfg.Out.EmitFinal(typ, payload); err != nil {
 		b.cfg.Log.Error("emit_failed", logx.Code(typ))
 	}
 }
@@ -198,13 +210,15 @@ func (b *Bridge) HostBlocked() {
 // Reject answers a line that is not processed (for example a wrong version).
 func (b *Bridge) Reject(replyTo, code string) { b.fail(replyTo, code) }
 
-func (b *Bridge) setState(s string) {
+func (b *Bridge) setState(s string) { b.changeState(s, b.emit) }
+
+func (b *Bridge) changeState(s string, emit func(string, any)) {
 	b.mu.Lock()
 	changed := b.state != s
 	b.state = s
 	b.mu.Unlock()
 	if changed {
-		b.emit(protocol.EvStatus, protocol.Status{State: s})
+		emit(protocol.EvStatus, protocol.Status{State: s})
 		b.cfg.Log.Info("status", logx.Code(s))
 	}
 }
@@ -346,7 +360,7 @@ func (b *Bridge) doInit(id string, c *protocol.Init) {
 	b.mu.Lock()
 	b.init = *c
 	b.init.StoreKey = "" // the key stays only in the open store's connection hook
-	b.sends = recent
+	b.sends = b.clampSends(recent, b.cfg.Now())
 	b.caps = &history.Caps{Days: c.Limits.HistoryDays, MaxPerChat: c.Limits.HistoryMaxPerChat, Now: b.cfg.Now}
 	b.lim = media.Limits{ImageMaxBytes: c.Limits.ImageMaxBytes, VoiceMaxSeconds: c.Limits.VoiceMaxSeconds, VoiceMaxBytes: c.Limits.VoiceBytes(), FileMaxBytes: protocol.MaxFileBytes}
 	b.mu.Unlock()
@@ -416,10 +430,12 @@ func (b *Bridge) connect(s *session) {
 	})
 }
 
-// Stop ends the bridge: it cancels every running operation, disconnects,
-// waits for the bridge's goroutines, and only then closes the store (or, after
-// a logout, deletes it). It is used for shutdown, stdin EOF, fatal errors and
-// logouts, and returns within about two seconds.
+// Stop ends the bridge: it closes stdout to everything but its own final
+// lines, cancels every running operation, disconnects, waits for the bridge's
+// goroutines, and only then closes the store (or, after a logout, deletes it).
+// It is used for shutdown, stdin EOF, fatal errors and logouts, and returns
+// within about two seconds. A goroutine that outlives the wait can no longer
+// write to stdout (review R-M1).
 func (b *Bridge) Stop() {
 	b.mu.Lock()
 	if b.stopped {
@@ -430,8 +446,8 @@ func (b *Bridge) Stop() {
 	s := b.sess
 	p := b.pair
 	b.pair = nil
-	lo := b.loggedOut
 	b.mu.Unlock()
+	b.cfg.Out.Quiesce()
 	if p != nil {
 		p.cancel()
 	}
@@ -451,25 +467,38 @@ func (b *Bridge) Stop() {
 		// A goroutine still runs; the store refuses its later calls (ErrClosed).
 		b.cfg.Log.Warn("stop_timeout")
 	}
+	// Read after the wait: a logout that WhatsApp confirmed while Stop was
+	// starting still deletes the store (review R-L7).
+	b.mu.Lock()
+	lo := b.loggedOut
+	b.mu.Unlock()
 	if s != nil {
 		if lo != nil {
 			if err := s.st.Wipe(); err != nil {
 				b.cfg.Log.Error("store_wipe_failed")
-				b.fail("", protocol.ErrStoreIO)
+				b.emitFinal(protocol.EvError, protocol.NewError("", protocol.ErrStoreIO))
 			} else {
 				b.cfg.Log.Info("store_wiped")
 			}
-			b.emit(protocol.EvLoggedOut, protocol.LoggedOut{Reason: lo.reason, Code: lo.code})
+			b.emitFinal(protocol.EvLoggedOut, protocol.LoggedOut{Reason: lo.reason, Code: lo.code})
 		} else if err := s.st.Close(); err != nil {
 			b.cfg.Log.Warn("store_close_failed")
 		}
 	}
 	if b.Initialized() {
-		b.setState(protocol.StateStopped)
+		b.changeState(protocol.StateStopped, b.emitFinal)
 	}
 	if lo != nil && lo.replyTo != "" {
-		b.emit(protocol.EvOK, protocol.Reply{ReplyTo: lo.replyTo})
+		b.emitFinal(protocol.EvOK, protocol.Reply{ReplyTo: lo.replyTo})
 	}
+}
+
+// LoggedOut reports whether the account was unlinked (after Stop: whether the
+// store was deleted). The caller then exits with ExitLoggedOut.
+func (b *Bridge) LoggedOut() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.loggedOut != nil
 }
 
 type logoutInfo struct {
@@ -483,10 +512,11 @@ type logoutInfo struct {
 // deletes the store after every goroutine has finished, then reports
 // logged_out, status stopped and, for the logout command, ok. The bridge never
 // opens a new store with the same key: the client restarts it with a new key
-// (PROTOCOL.md §6.4, review M3).
+// (PROTOCOL.md §6.4, review M3). It is recorded also when Stop has already
+// begun: Stop reads it after its wait (review R-L7).
 func (b *Bridge) loggedOutBy(old *session, reason string, code int, replyTo string) {
 	b.mu.Lock()
-	if b.sess != old || b.stopped || b.loggedOut != nil {
+	if b.sess != old || b.loggedOut != nil {
 		b.mu.Unlock()
 		return
 	}

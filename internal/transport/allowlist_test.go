@@ -267,3 +267,67 @@ func TestMediaClientHasBodyLimit(t *testing.T) {
 		t.Fatalf("media client transport is %T", c.Transport)
 	}
 }
+
+// Re-review R-L3: translated, tunnelled and reserved forms are refused by the
+// resolved-address check, with the IPv4 inside NAT64 and 6to4 addresses held
+// to the IPv4 rules; ordinary public addresses still pass.
+func TestPublicIPReservedAndTranslated(t *testing.T) {
+	cases := []struct {
+		ip     string
+		public bool
+	}{
+		// NAT64 (RFC 6052, RFC 8215): the embedded IPv4 decides; local-use is refused.
+		{"64:ff9b::7f00:1", false}, // 127.0.0.1
+		{"64:ff9b::a00:1", false},  // 10.0.0.1
+		{"64:ff9b::c0a8:101", false},
+		{"64:ff9b::9df0:101", true}, // 157.240.1.1
+		{"64:ff9b:1::a00:1", false},
+		{"64:ff9b:1::9df0:101", false},
+		// 6to4 (RFC 3056): the embedded IPv4 decides.
+		{"2002:7f00:1::1", false},
+		{"2002:c0a8:101::1", false},
+		{"2002:a00:1::1", false},
+		{"2002:9df0:101::1", true},
+		// Teredo, site-local, IPv4-compatible, documentation, discard-only.
+		{"2001::1", false},
+		{"2001:0:4136:e378:8000:63bf:3fff:fdd2", false},
+		{"fec0::1", false},
+		{"feff::1", false},
+		{"::127.0.0.1", false},
+		{"::9df0:101", false},
+		{"2001:db8::1", false},
+		{"100::1", false},
+		{"4000::1", false}, // outside the global unicast block 2000::/3
+		{"e000::1", false},
+		// Reserved IPv4.
+		{"0.1.2.3", false},
+		{"192.0.0.1", false},
+		{"192.0.0.170", false},
+		{"192.0.2.1", false},
+		{"198.18.0.1", false},
+		{"198.19.255.255", false},
+		{"198.51.100.7", false},
+		{"203.0.113.9", false},
+		{"240.0.0.1", false},
+		{"254.1.2.3", false},
+		{"255.255.255.255", false},
+		// The same, IPv4-mapped.
+		{"::ffff:198.18.0.1", false},
+		{"::ffff:240.0.0.1", false},
+		// Still public.
+		{"157.240.1.1", true},
+		{"31.13.64.1", true},
+		{"198.17.255.255", true},
+		{"198.20.0.1", true},
+		{"192.0.3.1", true},
+		{"2a03:2880:f001::1", true},
+		{"2001:2::1", false}, // benchmarking, in the IETF block 2001::/23
+		{"2001:200::1", true},
+		{"2001:4860::8888", true},
+	}
+	for _, c := range cases {
+		if got := PublicIP(net.ParseIP(c.ip)); got != c.public {
+			t.Errorf("PublicIP(%s) = %v, want %v", c.ip, got, c.public)
+		}
+	}
+}

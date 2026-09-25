@@ -70,6 +70,7 @@ type fakeClient struct {
 	pairNames  []string
 	logoutErr  error
 	logouts    int
+	logoutGate chan struct{} // when set, Logout waits for it (ignoring ctx) and then succeeds
 }
 
 type sentMsg struct {
@@ -196,8 +197,14 @@ func (f *fakeClient) Upload(ctx context.Context, data []byte, _ whatsmeow.MediaT
 
 func (f *fakeClient) Logout(ctx context.Context) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.logouts++
+	gate := f.logoutGate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate // WhatsApp confirms the unlink whatever happens meanwhile
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.logoutErr != nil {
 		return f.logoutErr
 	}
@@ -298,6 +305,7 @@ type harness struct {
 	mkFake   func() *fakeClient
 	now      time.Time // base time; Now() returns now plus the advanced offset
 	offset   atomic.Int64
+	nowHook  atomic.Pointer[func()] // when set, runs on every call of the bridge's clock
 	ids      *protocol.IDSource
 	refresh  int
 	opens    int // OpenStore calls
@@ -349,7 +357,12 @@ func newHarness(t *testing.T, mk func() *fakeClient) *harness {
 	cfg := Config{
 		Out: protocol.NewWriter(pw, nil),
 		Log: logx.New(h.stderr, nil),
-		Now: func() time.Time { return h.now.Add(time.Duration(h.offset.Load())) },
+		Now: func() time.Time {
+			if f := h.nowHook.Load(); f != nil {
+				(*f)()
+			}
+			return h.now.Add(time.Duration(h.offset.Load()))
+		},
 		OpenStore: func(ctx context.Context, d string, key []byte) (*store.Store, error) {
 			h.mu.Lock()
 			h.opens++

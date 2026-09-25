@@ -90,6 +90,9 @@ func (b *Bridge) processHistorySafe(s *session, n *waE2E.HistorySyncNotification
 }
 
 func (b *Bridge) historyDone(s *session) {
+	if s.ctx.Err() != nil {
+		return
+	}
 	s.hmu.Lock()
 	already := s.hdone
 	s.hdone = true
@@ -187,6 +190,11 @@ func (b *Bridge) historyConversation(s *session, syncType string, conv *waHistor
 	descs := map[string]store.MediaDesc{}
 	reactions := map[string][]protocol.Reaction{}
 	for _, hm := range conv.GetMessages() {
+		// A cancelled session (Stop, logout) ends the worker here, not after
+		// the whole conversation (review R-M1).
+		if ctx.Err() != nil {
+			return
+		}
 		wm := hm.GetMessage()
 		if wm == nil || wm.GetMessage() == nil {
 			continue // stubs (system notices without a body) are not reported in v1
@@ -218,6 +226,9 @@ func (b *Bridge) historyConversation(s *session, syncType string, conv *waHistor
 			reactions[m.ID] = append(reactions[m.ID], protocol.Reaction{ChatJID: chat, MessageID: m.ID, SenderJID: sender, Emoji: truncate(r.GetText(), 32), At: at})
 		}
 	}
+	if ctx.Err() != nil {
+		return
+	}
 	b.mu.Lock()
 	caps := b.caps
 	b.mu.Unlock()
@@ -246,7 +257,7 @@ func (b *Bridge) historyConversation(s *session, syncType string, conv *waHistor
 	}
 	for _, batch := range history.Split(meta, kept) {
 		seq, err := b.window.Acquire(ctx)
-		if err != nil {
+		if err != nil || ctx.Err() != nil {
 			return
 		}
 		b.emit(protocol.EvHistoryBatch, protocol.HistoryBatch{Seq: seq, SyncType: syncType, Chat: meta, Messages: batch, Progress: progress})
@@ -254,11 +265,17 @@ func (b *Bridge) historyConversation(s *session, syncType string, conv *waHistor
 	senders := map[string]bool{}
 	for _, m := range kept {
 		for _, r := range reactions[m.ID] {
+			if ctx.Err() != nil {
+				return
+			}
 			b.emit(protocol.EvReaction, r)
 		}
 		if isGroup && !m.FromMe {
 			senders[m.SenderJID] = true
 		}
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	if isGroup {
 		b.ensureGroup(s, chat)

@@ -65,6 +65,15 @@ func flags(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// stopCode is the exit code after a shutdown or stdin EOF: 0, or 7 when a
+// logout confirmed while the bridge was stopping deleted the store (§6.4).
+func stopCode(b *wa.Bridge) int {
+	if b.LoggedOut() {
+		return wa.ExitLoggedOut
+	}
+	return wa.ExitOK
+}
+
 // run is the whole program: it returns the process exit code (PROTOCOL.md §9).
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) (code int) {
 	if len(args) > 0 {
@@ -143,7 +152,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) (code
 			if !ok {
 				log.Info("stdin_eof")
 				b.Stop()
-				return wa.ExitOK
+				return stopCode(b)
 			}
 			env, err := protocol.ParseEnvelope(line)
 			var ve *protocol.VersionError
@@ -159,8 +168,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) (code
 			if b.Handle(env) {
 				log.Info("shutdown")
 				b.Stop()
-				_ = out.Emit(protocol.EvOK, protocol.Reply{ReplyTo: env.ID})
-				return wa.ExitOK
+				// Stop has closed stdout to all but the final lines (§6.11).
+				_ = out.EmitFinal(protocol.EvOK, protocol.Reply{ReplyTo: env.ID})
+				return stopCode(b)
 			}
 		case <-initTimer.C:
 			if !b.Initialized() {

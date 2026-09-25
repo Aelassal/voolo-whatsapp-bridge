@@ -428,3 +428,89 @@ func TestBinaryCrashOutputNeverReachesStderr(t *testing.T) {
 		t.Fatalf("stdout: %q", stdout.String())
 	}
 }
+
+// Re-review R-L1: fd 2 is the null device, not a pipe, so a crash report of
+// any size cannot block the runtime: a panic whose value is 1 MiB still exits
+// with 2 at once, and nothing of it reaches stderr.
+func TestBinaryLargeCrashExitsNotHangs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("stderr isolation on Windows is compile-checked only (PROTOCOL.md known limits)")
+	}
+	bin := buildBinary(t, "crashprobe")
+	cmd := exec.Command(bin)
+	cmd.Env = append(os.Environ(), "VOOLO_CRASHPROBE=big")
+	stdin, _ := cmd.StdinPipe() // kept open: the bridge waits for init
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	start := time.Now()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		<-done
+		t.Fatal("a 1 MiB panic hung the process instead of exiting")
+	}
+	stdin.Close()
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("exit took %v", d)
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 2 {
+		t.Fatalf("exit: %v, want the Go runtime crash code 2", err)
+	}
+	for _, s := range []string{"panic", "probe", "15550100002", "xxxxxxxx", "goroutine"} {
+		if strings.Contains(stderr.String(), s) {
+			t.Fatalf("stderr contains %q", s)
+		}
+	}
+	checkStderr(t, stderr.String())
+}
+
+// Re-review R-L1 (R-mut-M1c): a library that prints to the process's stderr
+// while the bridge runs neither reaches the client nor disturbs the bridge.
+func TestBinaryStrayStderrWritesAreDiscarded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("stderr isolation on Windows is compile-checked only (PROTOCOL.md known limits)")
+	}
+	bin := buildBinary(t, "crashprobe")
+	cmd := exec.Command(bin)
+	cmd.Env = append(os.Environ(), "VOOLO_CRASHPROBE=print")
+	stdin, _ := cmd.StdinPipe()
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(800 * time.Millisecond) // the probe has written by now
+	_, _ = io.WriteString(stdin, `{"v":1,"id":"01M3C03V80N87VFZS5G0J0NFEX","type":"shutdown","ts":1,"payload":{}}`+"\n")
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("exit: %v (stderr %d bytes)", err, stderr.Len())
+		}
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("bridge did not exit")
+	}
+	if strings.Contains(stderr.String(), "probe") {
+		t.Fatal("a stray stderr write reached the client")
+	}
+	checkStderr(t, stderr.String())
+	if !strings.Contains(stderr.String(), `"started"`) || !strings.Contains(stdout.String(), `"type":"ok"`) {
+		t.Fatalf("bridge's own output missing:\nstdout %s\nstderr %s", stdout.String(), stderr.String())
+	}
+}

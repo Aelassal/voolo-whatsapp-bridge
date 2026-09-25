@@ -175,6 +175,10 @@ func open(ctx context.Context, dir string, key []byte, log waLog.Logger) (*Store
 		db.Close()
 		return nil, classify(err)
 	}
+	if err := addDispatchedAt(ctx, db); err != nil {
+		db.Close()
+		return nil, classify(err)
+	}
 	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
 		if _, err := os.Stat(dbPath + suffix); err == nil {
 			_ = restrictMode(dbPath+suffix, false)
@@ -199,9 +203,10 @@ func classify(err error) error {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS voolo_sent (
-	outbox_id  TEXT PRIMARY KEY,
-	message_id TEXT,
-	created_at INTEGER NOT NULL
+	outbox_id     TEXT PRIMARY KEY,
+	message_id    TEXT,
+	created_at    INTEGER NOT NULL,
+	dispatched_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS voolo_media (
 	chat_jid        TEXT NOT NULL,
@@ -222,6 +227,20 @@ CREATE TABLE IF NOT EXISTS voolo_chats (
 	lid_alias_pending INTEGER NOT NULL DEFAULT 0
 );
 `
+
+// addDispatchedAt adds voolo_sent.dispatched_at to a store created before
+// the column existed (development builds before the first release).
+func addDispatchedAt(ctx context.Context, db *sql.DB) error {
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('voolo_sent') WHERE name='dispatched_at'`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `ALTER TABLE voolo_sent ADD COLUMN dispatched_at INTEGER`)
+	return err
+}
 
 // Close closes the database and releases the lock. It waits for method calls
 // in progress; later calls return ErrClosed. A second Close does nothing.
@@ -487,6 +506,20 @@ func (s *Store) ResolveLIDChat(ctx context.Context, lid, pn string) error {
 	return nil
 }
 
+// MarkDispatched records the time a reserved send was handed to WhatsApp.
+// Only such sends count toward the send backstop (PROTOCOL.md §6.5).
+func (s *Store) MarkDispatched(ctx context.Context, outboxID string, at time.Time) error {
+	db, done, err := s.use()
+	if err != nil {
+		return err
+	}
+	defer done()
+	if _, err := db.ExecContext(ctx, `UPDATE voolo_sent SET dispatched_at=$1 WHERE outbox_id=$2`, at.UnixMilli(), outboxID); err != nil {
+		return &IOError{err}
+	}
+	return nil
+}
+
 // OutboxKnown reports whether an outbox id is among the remembered ones,
 // without reserving it.
 func (s *Store) OutboxKnown(ctx context.Context, outboxID string) (bool, error) {
@@ -502,15 +535,16 @@ func (s *Store) OutboxKnown(ctx context.Context, outboxID string) (bool, error) 
 	return n > 0, nil
 }
 
-// RecentSends returns the reservation times of the sends made after since
-// (newest last), for the send backstop across restarts.
+// RecentSends returns the times at which sends were handed to WhatsApp after
+// since (newest last), for the send backstop across restarts. A reserved
+// outbox id that never reached WhatsApp is not included.
 func (s *Store) RecentSends(ctx context.Context, since time.Time) ([]time.Time, error) {
 	db, done, err := s.use()
 	if err != nil {
 		return nil, err
 	}
 	defer done()
-	rows, err := db.QueryContext(ctx, `SELECT created_at FROM voolo_sent WHERE created_at > $1 ORDER BY created_at, rowid`, since.UnixMilli())
+	rows, err := db.QueryContext(ctx, `SELECT dispatched_at FROM voolo_sent WHERE dispatched_at > $1 ORDER BY dispatched_at, rowid`, since.UnixMilli())
 	if err != nil {
 		return nil, &IOError{err}
 	}

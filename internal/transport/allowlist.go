@@ -13,6 +13,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 )
@@ -101,22 +102,82 @@ type Options struct {
 // LookupFunc resolves a host name to its addresses.
 type LookupFunc func(ctx context.Context, host string) ([]net.IPAddr, error)
 
-// PublicIP reports whether ip may be dialed: a global unicast address that is
-// not loopback, private (RFC 1918, RFC 4193), link-local, shared (RFC 6598),
-// unspecified, multicast or broadcast.
+// Address ranges that are never dialed (review L14, R-L3). IPv4 addresses
+// inside NAT64 and 6to4 addresses are held to the IPv4 list.
+var (
+	deniedV4 = prefixes(
+		"0.0.0.0/8",       // "this network"
+		"10.0.0.0/8",      // private (RFC 1918)
+		"100.64.0.0/10",   // shared, carrier-grade NAT (RFC 6598)
+		"127.0.0.0/8",     // loopback
+		"169.254.0.0/16",  // link-local
+		"172.16.0.0/12",   // private
+		"192.0.0.0/24",    // IETF protocol assignments (RFC 6890)
+		"192.0.2.0/24",    // TEST-NET-1
+		"192.168.0.0/16",  // private
+		"198.18.0.0/15",   // benchmarking (RFC 2544)
+		"198.51.100.0/24", // TEST-NET-2
+		"203.0.113.0/24",  // TEST-NET-3
+		"224.0.0.0/4",     // multicast
+		"240.0.0.0/4",     // reserved, and the broadcast address
+	)
+	// Inside the global unicast block 2000::/3 (everything outside it, such
+	// as ::/96, 64:ff9b:1::/48, 100::/64, fc00::/7, fe80::/10, fec0::/10 and
+	// ff00::/8, is refused by that rule alone).
+	deniedV6 = prefixes(
+		"2001::/23",     // IETF protocol assignments: Teredo 2001::/32, benchmarking, ORCHID
+		"2001:db8::/32", // documentation
+	)
+	global6   = netip.MustParsePrefix("2000::/3")     // IANA global unicast; the rest is reserved
+	nat64     = netip.MustParsePrefix("64:ff9b::/96") // RFC 6052: IPv4 in the last 32 bits
+	sixToFour = netip.MustParsePrefix("2002::/16")    // RFC 3056: IPv4 in bits 16–47
+)
+
+func prefixes(ss ...string) []netip.Prefix {
+	out := make([]netip.Prefix, len(ss))
+	for i, s := range ss {
+		out[i] = netip.MustParsePrefix(s)
+	}
+	return out
+}
+
+func inAny(a netip.Addr, ps []netip.Prefix) bool {
+	for _, p := range ps {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// PublicIP reports whether ip may be dialed. For IPv6 only the global
+// unicast block 2000::/3 is dialed, which leaves out loopback, unspecified,
+// IPv4-compatible, unique-local, link-local, site-local, multicast, local-use
+// NAT64 and discard-only addresses; inside it, Teredo and the other IETF
+// protocol assignments and documentation addresses are refused. For IPv4 it
+// refuses loopback, private (RFC 1918), link-local, shared (RFC 6598),
+// "this network", multicast, broadcast, benchmarking, documentation and other
+// reserved addresses;
+// for NAT64 (64:ff9b::/96), 6to4 (2002::/16) and IPv4-mapped addresses it
+// judges the IPv4 address inside.
 func PublicIP(ip net.IP) bool {
-	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+	a, ok := netip.AddrFromSlice(ip)
+	if !ok {
 		return false
 	}
-	if v4 := ip.To4(); v4 != nil {
-		if v4[0] == 100 && v4[1]&0xc0 == 64 { // 100.64.0.0/10, carrier-grade NAT
-			return false
-		}
-		if v4.Equal(net.IPv4bcast) || v4[0] == 0 {
-			return false
+	a = a.Unmap()
+	if a.Is6() {
+		b := a.As16()
+		switch {
+		case nat64.Contains(a):
+			a = netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]})
+		case sixToFour.Contains(a):
+			a = netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]})
+		default:
+			return global6.Contains(a) && !inAny(a, deniedV6)
 		}
 	}
-	return true
+	return !inAny(a, deniedV4)
 }
 
 // Resolve wraps a dialer so that an allowed name is resolved first and only

@@ -133,3 +133,19 @@ func TestSplitRespectsCountAndBytes(t *testing.T) {
 		t.Fatal("empty chat gives a batch")
 	}
 }
+
+// Re-review R-M1: a cancelled context gets no seq, even when the window has room.
+func TestAcquireWithCancelledContext(t *testing.T) {
+	w := NewWindow(4)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if seq, err := w.Acquire(ctx); err == nil {
+		t.Fatalf("Acquire on a cancelled context gave seq %d", seq)
+	}
+	if w.Outstanding() != 0 {
+		t.Fatal("a seq was reserved")
+	}
+	if seq, err := w.Acquire(context.Background()); err != nil || seq != 1 {
+		t.Fatalf("next Acquire: %d %v", seq, err)
+	}
+}

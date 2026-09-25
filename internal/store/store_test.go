@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ncruces/go-sqlite3"
 	"github.com/ncruces/go-sqlite3/driver"
 	"go.mau.fi/whatsmeow/store/sqlstore/upgrades"
 )
@@ -422,5 +423,110 @@ func TestMethodsAfterCloseAndWipe(t *testing.T) {
 		if err := s.Close(); err != nil {
 			t.Errorf("second Close after %s: %v", end, err)
 		}
+	}
+}
+
+// Re-review R-L6 (R-mut-M3b, M3c): Wipe deletes a -wal that outlives the
+// store's own connections (another connection keeps it) and a stale
+// -journal, not only the files SQLite leaves after a clean close.
+func TestWipeRemovesWALAndJournalLeftovers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("an open file cannot be deleted on Windows")
+	}
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := Open(ctx, dir, key(8), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dir, DBFile)
+	// A second connection to the same file keeps the WAL alive past the
+	// store's own close.
+	other, err := driver.Open(dsn(dbPath), func(c *sqlite3.Conn) error {
+		return c.Exec("PRAGMA hexkey='" + strings.Repeat("08", 32) + "'; PRAGMA journal_mode=WAL;")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if _, err := other.Exec("CREATE TABLE x (a); INSERT INTO x VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dbPath+"-journal", []byte("stale journal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dbPath + "-wal"); err != nil {
+		t.Fatalf("test setup: no -wal file: %v", err)
+	}
+	if err := s.Wipe(); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		if _, err := os.Stat(dbPath + suffix); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s%s still exists after Wipe", DBFile, suffix)
+		}
+	}
+}
+
+// Lead decision (2026-09-25) on the send backstop: only sends handed to
+// WhatsApp count. A reserved outbox id that never reached WhatsApp (refused
+// media, a failed upload) is not a recent send, across restarts too.
+func TestRecentSendsCountsDispatchedOnly(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := Open(ctx, dir, key(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.UnixMilli(1790330400000)
+	for i, id := range []string{"01M3C03V80N87VFZS5G0J0NFA1", "01M3C03V80N87VFZS5G0J0NFA2", "01M3C03V80N87VFZS5G0J0NFA3"} {
+		if _, err := s.ReserveOutbox(ctx, id, t0.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.MarkDispatched(ctx, "01M3C03V80N87VFZS5G0J0NFA2", t0.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open(ctx, dir, key(4), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, err := s.RecentSends(ctx, t0.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || !got[0].Equal(t0.Add(5*time.Second)) {
+		t.Fatalf("recent sends %v, want only the dispatch time of the one dispatched send", got)
+	}
+	// Still a duplicate: the reservation itself is kept.
+	if known, _ := s.OutboxKnown(ctx, "01M3C03V80N87VFZS5G0J0NFA1"); !known {
+		t.Fatal("an undispatched reservation was forgotten")
+	}
+}
+
+// A store made before voolo_sent.dispatched_at existed gets the column on open.
+func TestDispatchedAtAddedToOlderStore(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := Open(ctx, dir, key(5), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`ALTER TABLE voolo_sent DROP COLUMN dispatched_at`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open(ctx, dir, key(5), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.ReserveOutbox(ctx, "01M3C03V80N87VFZS5G0J0NFB1", time.UnixMilli(1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkDispatched(ctx, "01M3C03V80N87VFZS5G0J0NFB1", time.UnixMilli(2)); err != nil {
+		t.Fatalf("MarkDispatched on an upgraded store: %v", err)
 	}
 }

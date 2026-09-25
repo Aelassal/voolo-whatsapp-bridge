@@ -57,6 +57,7 @@ const (
 func (b *Bridge) backstopAllows(now time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.sends = b.clampSends(b.sends, now)
 	keep := b.sends[:0]
 	for _, t := range b.sends {
 		if now.Sub(t) < SendWindow {
@@ -71,6 +72,31 @@ func (b *Bridge) backstopAllows(now time.Time) bool {
 		return false
 	}
 	return true
+}
+
+// clampSends moves send times that lie after now (the clock went back since
+// they were taken) to one floor interval before now, and keeps their order.
+// Such a send then counts for one window from the moment the bridge notices,
+// so a clock set back never blocks sends for longer than SendWindow, and it
+// does not trip the 1 s floor by itself (review R-L4).
+func (b *Bridge) clampSends(sends []time.Time, now time.Time) []time.Time {
+	limit := now.Add(-MinSendInterval)
+	n := 0
+	for i, t := range sends {
+		if t.After(now) {
+			sends[i] = limit
+			n++
+		}
+	}
+	if n > 0 {
+		for i := 1; i < len(sends); i++ {
+			if sends[i].Before(sends[i-1]) {
+				sends[i] = sends[i-1]
+			}
+		}
+		b.cfg.Log.Warn("send_clock_skew", logx.N(int64(n)))
+	}
+	return sends
 }
 
 func (b *Bridge) recordSend(t time.Time) {
@@ -134,12 +160,18 @@ func (b *Bridge) beginSend(id, chatJID, outboxID string) (s *session, to types.J
 	if dup {
 		return refuse(protocol.ErrDuplicateOutboxID)
 	}
-	b.recordSend(now)
 	return s, to, free, true
 }
 
-// deliver sends one message, once. It is never retried by the bridge.
+// deliver sends one message, once. It is never retried by the bridge. The
+// send counts toward the backstop from here, where it is handed to WhatsApp
+// (lead decision 2026-09-25: a send refused before this point does not count).
 func (b *Bridge) deliver(s *session, id, outboxID string, to types.JID, msg *waE2E.Message, release func()) {
+	now := b.cfg.Now()
+	b.recordSend(now)
+	if err := s.st.MarkDispatched(s.ctx, outboxID, now); err != nil {
+		b.cfg.Log.Warn("store_write_failed", logx.Code("outbox"))
+	}
 	ctx, cancel := context.WithTimeout(s.ctx, b.cfg.SendTimeout+5*time.Second)
 	defer cancel()
 	resp, err := s.cli.SendMessage(ctx, to, msg, whatsmeow.SendRequestExtra{Timeout: b.cfg.SendTimeout})
@@ -383,10 +415,7 @@ func (b *Bridge) fetchMedia(id string, c *protocol.FetchMedia) {
 	}
 	durationS := d.DurationS
 	if d.Kind == "voice" {
-		// The duration of the file itself where it can be read (review L10).
-		if secs := media.OggDurationSeconds(data); secs > 0 {
-			durationS = secs
-		}
+		durationS = voiceDuration(d.DurationS, media.OggDurationSeconds(data))
 	}
 	if media.CheckFetch(d.Kind, int64(len(data)), durationS, lim) != nil {
 		clear(data)
@@ -401,6 +430,21 @@ func (b *Bridge) fetchMedia(id string, c *protocol.FetchMedia) {
 	}
 	b.emit(protocol.EvMediaReady, protocol.MediaReady{ReplyTo: id, MessageID: c.MessageID, Path: sealed.Path, Key: sealed.Key,
 		SHA256: sealed.SHA256, Mime: d.Mime, SizeBytes: sealed.SizeBytes, DurationS: durationS})
+}
+
+// VoiceDurationMargin is how far a received voice file may read shorter than
+// its declared length and still be taken at its own word.
+const VoiceDurationMargin = 2
+
+// voiceDuration is the duration reported and capped for a received voice
+// note: the file's own where it can be read (review L10), but never much less
+// than the sender declared, since the file is the sender's word too (review
+// R-L2). An unreadable file keeps the declared length.
+func voiceDuration(declared, file int) int {
+	if file <= 0 || declared-file > VoiceDurationMargin {
+		return max(declared, file)
+	}
+	return file
 }
 
 func (b *Bridge) logout(id string) {

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -34,9 +35,10 @@ const Overhead = 12 + 16
 // capped at n bytes is cut off after n + DownloadOverhead bytes.
 const DownloadOverhead = 16 + 10
 
-// testHookAfterCheck, when set by a test, runs between the path check and the
-// read in Open.
-var testHookAfterCheck func(path string)
+// Test seams in Open: testHookAfterCheck runs between the path check and the
+// open, testHookAfterStat between the size check on the open handle and the
+// read.
+var testHookAfterCheck, testHookAfterStat func(path string)
 
 // StaleAfter is the age after which leftover hand-off files are deleted at start.
 const StaleAfter = time.Hour
@@ -146,6 +148,9 @@ func Open(dir, path, keyHex, sha256Hex string, maxBytes int64) ([]byte, error) {
 	if err != nil || len(want) != 32 {
 		return nil, ErrInvalid
 	}
+	if testHookAfterStat != nil {
+		testHookAfterStat(path)
+	}
 	data, err := io.ReadAll(io.LimitReader(f, maxBytes+Overhead+1))
 	if err != nil {
 		return nil, ErrInvalid
@@ -249,41 +254,73 @@ func MaxSendBytes(kind string, l Limits) int64 {
 	}
 }
 
-// OggDurationSeconds returns the duration of an Ogg Opus stream (from the
-// granule position of the last page, at 48 kHz, minus the pre-skip), rounded
-// up, or 0 when it cannot tell.
-func OggDurationSeconds(b []byte) int {
-	if len(b) < 27 || !strings.HasPrefix(string(b[:4]), "OggS") {
-		return 0
-	}
-	var preSkip uint16
-	if i := indexOf(b, "OpusHead"); i >= 0 && i+12 <= len(b) {
-		preSkip = binary.LittleEndian.Uint16(b[i+10 : i+12])
-	}
-	last := -1
-	for i := len(b) - 27; i >= 0; i-- {
-		if b[i] == 'O' && string(b[i:i+4]) == "OggS" {
-			last = i
-			break
-		}
-	}
-	if last < 0 {
-		return 0
-	}
-	granule := binary.LittleEndian.Uint64(b[last+6 : last+14])
-	if granule == ^uint64(0) || granule <= uint64(preSkip) {
-		return 0
-	}
-	samples := granule - uint64(preSkip)
-	return int((samples + 47999) / 48000)
-}
+// MaxOggBytesPerSecond bounds the size of one second of Ogg Opus: Opus's
+// highest bitrate (510 kbit/s, about 63.75 kB/s) plus the Ogg page framing.
+const MaxOggBytesPerSecond = 72000
 
-func indexOf(b []byte, s string) int {
-	n := len(s)
-	for i := 0; i+n <= len(b) && i < 4096; i++ {
-		if string(b[i:i+n]) == s {
-			return i
+// OggDurationSeconds returns the duration of an Ogg Opus stream, rounded up,
+// or 0 when it cannot tell. It walks every page from the start (RFC 3533)
+// instead of trusting the last one (review R-L2):
+//   - every page is a version-0 page, its segment table and body fit, and the
+//     next page starts right after it; nothing may follow the last page, and
+//     no page may follow the end-of-stream page;
+//   - the first page begins the one logical stream with a full OpusHead
+//     packet (RFC 7845), every later page belongs to that stream, and page
+//     sequence numbers increase by one;
+//   - granule positions never decrease (-1, "no packet ends here", is skipped).
+//
+// The duration is the largest granule, at 48 kHz, minus the pre-skip, and
+// never less than the file's size allows at MaxOggBytesPerSecond, so granules
+// forged small on every page still cannot shorten a long file much.
+func OggDurationSeconds(b []byte) int {
+	var (
+		serial, prevSeq uint32
+		preSkip, maxGr  uint64
+		seenGr, ended   bool
+	)
+	for off, page := 0, 0; off < len(b); page++ {
+		if ended || len(b)-off < 27 || string(b[off:off+4]) != "OggS" || b[off+4] != 0 {
+			return 0
 		}
+		flags := b[off+5]
+		granule := binary.LittleEndian.Uint64(b[off+6:])
+		ser := binary.LittleEndian.Uint32(b[off+14:])
+		seq := binary.LittleEndian.Uint32(b[off+18:])
+		hdr := 27 + int(b[off+26])
+		if len(b)-off < hdr {
+			return 0
+		}
+		body := 0
+		for _, l := range b[off+27 : off+hdr] {
+			body += int(l)
+		}
+		if len(b)-off-hdr < body {
+			return 0
+		}
+		data := b[off+hdr : off+hdr+body]
+		if page == 0 {
+			if flags&0x02 == 0 || len(data) < 19 || string(data[:8]) != "OpusHead" {
+				return 0
+			}
+			serial = ser
+			preSkip = uint64(binary.LittleEndian.Uint16(data[10:12]))
+		} else if ser != serial || flags&0x02 != 0 || seq != prevSeq+1 {
+			return 0
+		}
+		prevSeq = seq
+		if granule != ^uint64(0) {
+			if seenGr && granule < maxGr {
+				return 0
+			}
+			maxGr, seenGr = granule, true
+		}
+		ended = flags&0x04 != 0
+		off += hdr + body
 	}
-	return -1
+	if !seenGr || maxGr <= preSkip {
+		return 0
+	}
+	secs := min((maxGr-preSkip+47999)/48000, math.MaxInt32)
+	floor := (len(b) + MaxOggBytesPerSecond - 1) / MaxOggBytesPerSecond
+	return max(int(secs), floor)
 }

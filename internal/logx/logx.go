@@ -67,7 +67,7 @@ func init() {
 	for _, e := range []string{
 		// process and stdio
 		"started", "stdin_eof", "shutdown", "init_timeout", "line_dropped", "emit_failed", "panic", "panic_recovered",
-		"stop_timeout", "exit_logged_out",
+		"stop_timeout", "exit_logged_out", "emit_dropped",
 		// init and store
 		"ready", "fatal", "store_open_failed", "store_close_failed", "store_wiped", "store_wipe_failed", "store_write_failed",
 		"media_prune_failed", "media_stale_deleted",
@@ -75,7 +75,7 @@ func init() {
 		"command_refused", "status", "signal", "connect_failed", "host_blocked", "logged_out",
 		"pairing_started", "pairing_failed", "pairing_timeout", "paired",
 		"version_refreshed", "version_refresh_failed",
-		"send_ok", "send_failed", "send_refused", "fetch_failed",
+		"send_ok", "send_failed", "send_refused", "send_clock_skew", "fetch_failed",
 		"group_info_failed", "joined_groups_failed",
 		"history_capped", "history_done", "history_download_failed",
 		// whatsmeow's own warnings and errors (constant format string as code)

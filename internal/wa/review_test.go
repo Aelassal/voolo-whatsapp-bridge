@@ -379,15 +379,22 @@ func TestM2FetchMediaBoundedByRealSize(t *testing.T) {
 	}
 }
 
+// oggStream is a structurally valid Ogg Opus stream of the given length: an
+// OpusHead page and one audio page whose granule is seconds × 48 kHz.
 func oggStream(seconds int) []byte {
-	page := func(granule uint64, payload []byte) []byte {
-		b := make([]byte, 27)
+	page := func(flags byte, granule uint64, seq uint32, body []byte) []byte {
+		b := make([]byte, 27, 28+len(body))
 		copy(b, "OggS")
+		b[5] = flags
 		binary.LittleEndian.PutUint64(b[6:], granule)
-		return append(b, payload...)
+		binary.LittleEndian.PutUint32(b[14:], 0x566f6f6c) // stream serial
+		binary.LittleEndian.PutUint32(b[18:], seq)
+		b[26] = 1
+		b = append(b, byte(len(body)))
+		return append(b, body...)
 	}
-	head := append([]byte("OpusHead"), 1, 1, 0, 0)
-	return append(page(0, head), page(uint64(seconds)*48000, []byte("opus data"))...)
+	head := append([]byte("OpusHead"), 1, 1, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0) // 19 bytes, pre-skip 0
+	return append(page(0x02, 0, 0, head), page(0x04, uint64(seconds)*48000, 1, []byte("opus data"))...)
 }
 
 // L10: voice duration comes from the file where it can be read.

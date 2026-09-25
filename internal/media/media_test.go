@@ -177,21 +177,131 @@ func TestFetchCaps(t *testing.T) {
 	}
 }
 
-func oggPage(granule uint64, payload []byte) []byte {
-	h := make([]byte, 27)
+// oggPage builds one Ogg page (RFC 3533) with a correct segment table.
+func oggPage(flags byte, granule uint64, serial, seq uint32, body []byte) []byte {
+	var lacing []byte
+	n := len(body)
+	for n >= 255 {
+		lacing = append(lacing, 255)
+		n -= 255
+	}
+	lacing = append(lacing, byte(n))
+	h := make([]byte, 27, 27+len(lacing)+len(body))
 	copy(h, "OggS")
+	h[5] = flags
 	binary.LittleEndian.PutUint64(h[6:], granule)
-	return append(h, payload...)
+	binary.LittleEndian.PutUint32(h[14:], serial)
+	binary.LittleEndian.PutUint32(h[18:], seq)
+	h[26] = byte(len(lacing))
+	h = append(h, lacing...)
+	return append(h, body...)
+}
+
+const serial = 0x566f6f6c
+
+// opusHead is a 19-byte OpusHead packet with the given pre-skip.
+func opusHead(preSkip uint16) []byte {
+	b := append([]byte("OpusHead"), 1, 1, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint16(b[10:], preSkip)
+	return b
+}
+
+// oggOpus is a stream of an OpusHead page, an OpusTags page and one audio
+// page per granule.
+func oggOpus(preSkip uint16, granules ...uint64) []byte {
+	b := oggPage(0x02, 0, serial, 0, opusHead(preSkip))
+	b = append(b, oggPage(0, 0, serial, 1, []byte("OpusTags\x00\x00\x00\x00\x00\x00\x00\x00"))...)
+	for i, g := range granules {
+		flags := byte(0)
+		if i == len(granules)-1 {
+			flags = 0x04
+		}
+		b = append(b, oggPage(flags, g, serial, uint32(i+2), []byte("opus audio packet"))...)
+	}
+	return b
+}
+
+type pageArgs struct {
+	flags   byte
+	granule uint64
+	serial  uint32
+	seq     uint32
+	body    []byte
+}
+
+func page(flags byte, granule uint64, serial, seq uint32, body []byte) pageArgs {
+	return pageArgs{flags, granule, serial, seq, body}
+}
+
+func oggPages(ps ...pageArgs) []byte {
+	var b []byte
+	for _, p := range ps {
+		b = append(b, oggPage(p.flags, p.granule, p.serial, p.seq, p.body)...)
+	}
+	return b
 }
 
 func TestOggDuration(t *testing.T) {
-	head := append([]byte("OpusHead"), 1, 1, 0x38, 0x01) // pre-skip 312
-	stream := append(oggPage(0, head), oggPage(48000*14+312, []byte("data"))...)
-	if d := OggDurationSeconds(stream); d != 14 {
+	if d := OggDurationSeconds(oggOpus(312, 48000*5, 48000*14+312)); d != 14 {
 		t.Fatalf("duration %d", d)
+	}
+	// A page on which no packet ends has granule -1; it is skipped.
+	if d := OggDurationSeconds(oggOpus(0, 48000*3, ^uint64(0), 48000*7)); d != 7 {
+		t.Fatalf("duration with a -1 granule %d", d)
 	}
 	if OggDurationSeconds([]byte("not ogg at all, not ogg at all")) != 0 {
 		t.Fatal("non-ogg")
+	}
+}
+
+// Re-review R-L2: the duration is read from a walk over every page, so a
+// forged page anywhere cannot shorten it, and it is never below what the
+// file's size allows at Opus's highest bitrate. Anything inconsistent is
+// unreadable (0).
+func TestOggDurationForged(t *testing.T) {
+	long := oggOpus(0, 48000*3600, 48000*7200) // a 2-hour stream
+	if d := OggDurationSeconds(long); d != 7200 {
+		t.Fatalf("real stream: %d", d)
+	}
+	// The reviewer's case: a 27-byte page with a small granule appended.
+	forged := append(append([]byte(nil), long...), oggPage(0x04, 48000*3, serial, 99, nil)[:27]...)
+	forged[len(forged)-1] = 0 // no segments
+	if d := OggDurationSeconds(forged); d != 0 && d < 7200 {
+		t.Fatalf("forged trailing page read as %d s", d)
+	}
+	cases := map[string][]byte{
+		"trailing page, smaller granule":  append(append([]byte(nil), long...), oggPage(0x04, 48000*3, serial, 99, []byte("x"))...),
+		"trailing page, other stream":     append(append([]byte(nil), long...), oggPage(0x04, 48000*3, serial+1, 0, []byte("x"))...),
+		"trailing bytes after the last":   append(append([]byte(nil), long...), []byte("OggS\x00 garbage that is not a page at all.....")...),
+		"last page cut short":             long[:len(long)-3],
+		"granules going back":             oggOpus(0, 48000*7200, 48000*3),
+		"no OpusHead":                     append(oggPage(0x02, 0, serial, 0, []byte("OpusTagsxxxxxxxxxxxxxxxx")), oggPage(0x04, 48000*3, serial, 1, []byte("x"))...),
+		"short OpusHead":                  append(oggPage(0x02, 0, serial, 0, []byte("OpusHead\x01\x01\x00\x00")), oggPage(0x04, 48000*3, serial, 1, []byte("x"))...),
+		"version 1":                       func() []byte { b := oggOpus(0, 48000*3); b[4] = 1; return b }(),
+		"granule only up to the pre-skip": oggOpus(4000, 3000),
+		"granule of -1 on every page":     oggOpus(0, ^uint64(0)),
+		// Each of these only makes the stream longer, but is inconsistent all the same.
+		"page after the end of stream":         append(oggOpus(0, 48000*5), oggPage(0, 48000*6, serial, 3, []byte("x"))...),
+		"first page not a beginning of stream": oggPages(page(0, 0, serial, 0, opusHead(0)), page(0x04, 48000*6, serial, 1, []byte("x"))),
+		"later page of another stream":         oggPages(page(0x02, 0, serial, 0, opusHead(0)), page(0, 48000*3, serial, 1, []byte("x")), page(0, 48000*6, serial+1, 2, []byte("x"))),
+		"page sequence gap":                    oggPages(page(0x02, 0, serial, 0, opusHead(0)), page(0x04, 48000*6, serial, 2, []byte("x"))),
+		"second beginning of stream":           oggPages(page(0x02, 0, serial, 0, opusHead(0)), page(0x02, 48000*6, serial, 1, []byte("x"))),
+	}
+	for name, b := range cases {
+		if d := OggDurationSeconds(b); d != 0 {
+			t.Errorf("%s: read as %d s, want unreadable", name, d)
+		}
+	}
+	// Granules scaled down on every page: the size of the file still bounds
+	// the duration from below.
+	big := oggPage(0x02, 0, serial, 0, opusHead(0))
+	body := bytes.Repeat([]byte{0x5a}, 255*255-1) // the most one page holds
+	for i := 0; i < 16; i++ {                     // about 1 MB of audio
+		big = append(big, oggPage(0, uint64(i+1)*3000, serial, uint32(i+1), body)...)
+	}
+	d := OggDurationSeconds(big)
+	if floor := len(big) / MaxOggBytesPerSecond; d < floor || d < 14 {
+		t.Fatalf("1 MB stream whose granules claim 1 s read as %d s, want at least %d", d, floor)
 	}
 }
 
@@ -224,6 +334,56 @@ func TestOpenChecksTheHandleItReads(t *testing.T) {
 	}
 	if _, err := os.Stat(s.Path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("truncated file not deleted")
+	}
+}
+
+// Re-review R-L6 (R-mut-L4c): the checked file moved aside and a link to it
+// put in its place. The handle would then be the checked file, so only
+// O_NOFOLLOW refuses it.
+func TestOpenRefusesLinkToTheCheckedFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks need privileges on Windows")
+	}
+	dir := t.TempDir()
+	s, _ := Seal(dir, plaintext)
+	aside := filepath.Join(t.TempDir(), "aside.bin")
+	testHookAfterCheck = func(p string) {
+		_ = os.Rename(p, aside)
+		_ = os.Symlink(aside, p)
+	}
+	defer func() { testHookAfterCheck = nil }()
+	if _, err := Open(dir, s.Path, s.Key, s.SHA256, 1<<20); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("link to the checked file: want ErrInvalid, got %v", err)
+	}
+}
+
+// Re-review R-L6 (R-mut-L4b): a regular file renamed over the path after the
+// check is not the checked file, even with the same bytes; only the
+// comparison of the open handle with the checked file refuses it.
+func TestOpenRefusesRenameSwap(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Seal(dir, plaintext)
+	raw, _ := os.ReadFile(s.Path)
+	other := filepath.Join(dir, "other.tmp")
+	if err := os.WriteFile(other, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterCheck = func(p string) { _ = os.Rename(other, p) }
+	defer func() { testHookAfterCheck = nil }()
+	if _, err := Open(dir, s.Path, s.Key, s.SHA256, 1<<20); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("rename swap: want ErrInvalid, got %v", err)
+	}
+}
+
+// Re-review R-L6 (R-mut-L4d): a file cut short after the size check on the
+// handle, before it is read, gives media_invalid, not a panic.
+func TestOpenFileCutShortAfterStat(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := Seal(dir, plaintext)
+	testHookAfterStat = func(p string) { _ = os.Truncate(p, 5) }
+	defer func() { testHookAfterStat = nil }()
+	if _, err := Open(dir, s.Path, s.Key, s.SHA256, 1<<20); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("cut short after stat: want ErrInvalid, got %v", err)
 	}
 }
 

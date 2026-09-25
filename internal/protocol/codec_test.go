@@ -377,3 +377,31 @@ func TestULIDOverflowRefused(t *testing.T) {
 		}
 	}
 }
+
+// Re-review R-M1: once the writer is quiesced (Stop has begun), only the final
+// lines written through EmitFinal reach the stream; everything else is
+// dropped and counted.
+func TestWriterQuiesce(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf, nil)
+	if err := w.Emit(EvPong, Reply{ReplyTo: "01M3C03V80N87VFZS5G0J0NFEX"}); err != nil {
+		t.Fatal(err)
+	}
+	w.Quiesce()
+	if err := w.Emit(EvHistoryBatch, HistoryBatch{Seq: 1, SyncType: "initial"}); !errors.Is(err, ErrQuiesced) {
+		t.Fatalf("Emit after Quiesce: %v", err)
+	}
+	if err := w.Emit(EvReaction, Reaction{}); !errors.Is(err, ErrQuiesced) {
+		t.Fatalf("Emit after Quiesce: %v", err)
+	}
+	if n := w.Dropped(); n != 2 {
+		t.Fatalf("dropped %d", n)
+	}
+	if err := w.EmitFinal(EvStatus, Status{State: StateStopped}); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], `"type":"pong"`) || !strings.Contains(lines[1], `"type":"status"`) {
+		t.Fatalf("stream: %q", buf.String())
+	}
+}

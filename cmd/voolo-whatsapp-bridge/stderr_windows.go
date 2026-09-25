@@ -6,32 +6,28 @@
 package main
 
 import (
-	"io"
 	"os"
 
 	"golang.org/x/sys/windows"
 )
 
 // isolateStderr keeps the original stderr handle for the bridge's own JSON
-// diagnostics and makes the process's standard error a pipe that is read and
-// thrown away, so the Go runtime's crash output (which it writes to the
-// handle GetStdHandle returns at that moment) and library prints never reach
-// the client (review M1). On any failure it returns os.Stderr unchanged.
+// diagnostics and makes the process's standard error the null device (NUL),
+// so the Go runtime's crash output (which it writes to the handle
+// GetStdHandle returns at that moment) and library prints never reach the
+// client (review M1). NUL never blocks, so a crash report of any size cannot
+// hang the process (review R-L1). On any failure it returns os.Stderr
+// unchanged.
 func isolateStderr() *os.File {
 	orig := os.Stderr
-	r, w, err := os.Pipe()
+	devnull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		return orig
 	}
-	if err := windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(w.Fd())); err != nil {
-		r.Close()
-		w.Close()
+	if err := windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(devnull.Fd())); err != nil {
+		devnull.Close()
 		return orig
 	}
-	os.Stderr = w
-	go func() {
-		defer func() { _ = recover() }()
-		_, _ = io.Copy(io.Discard, r)
-	}()
+	os.Stderr = devnull
 	return orig
 }

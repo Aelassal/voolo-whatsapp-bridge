@@ -44,7 +44,7 @@ func TestContentOfKinds(t *testing.T) {
 		{"audio", &waE2E.Message{AudioMessage: &waE2E.AudioMessage{}}, "audio", "", true},
 		{"document", &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{FileName: proto.String("a.pdf")}}, "document", "", true},
 		{"location", &waE2E.Message{LocationMessage: &waE2E.LocationMessage{}}, "location", "", true},
-		{"contact", &waE2E.Message{ContactMessage: &waE2E.ContactMessage{Vcard: proto.String("BEGIN:VCARD TEL:+201001234567")}}, "contact", "", true},
+		{"contact", &waE2E.Message{ContactMessage: &waE2E.ContactMessage{Vcard: proto.String("BEGIN:VCARD TEL:+15550100009")}}, "contact", "", true},
 		{"poll", &waE2E.Message{PollCreationMessageV3: &waE2E.PollCreationMessage{Name: proto.String("when?")}}, "poll", "when?", true},
 		{"unknown type", &waE2E.Message{ButtonsMessage: &waE2E.ButtonsMessage{}}, "unsupported", "", true},
 		{"reaction", &waE2E.Message{ReactionMessage: &waE2E.ReactionMessage{}}, "", "", false},
@@ -61,7 +61,7 @@ func TestContentOfKinds(t *testing.T) {
 		}
 	}
 	// A contact card's vCard (third-party numbers) is never reported.
-	if c, _ := ContentOf(&waE2E.Message{ContactMessage: &waE2E.ContactMessage{Vcard: proto.String("TEL:+201001234567")}}, false); c.Text != "" {
+	if c, _ := ContentOf(&waE2E.Message{ContactMessage: &waE2E.ContactMessage{Vcard: proto.String("TEL:+15550100009")}}, false); c.Text != "" {
 		t.Fatal("vcard leaked")
 	}
 	// View-once media is neither described nor downloadable.

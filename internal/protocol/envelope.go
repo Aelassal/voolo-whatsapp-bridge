@@ -212,13 +212,19 @@ func (lr *LineReader) Next() ([]byte, error) {
 // ErrLineTooLong is returned by Writer when an encoded line would exceed MaxLineBytes.
 var ErrLineTooLong = errors.New("line too long")
 
+// ErrQuiesced is returned by Emit once the writer is quiesced: the line was
+// dropped.
+var ErrQuiesced = errors.New("writer quiesced")
+
 // Writer encodes events as lines. It is safe for concurrent use; each event is
 // written with a single Write call.
 type Writer struct {
-	mu  sync.Mutex
-	w   io.Writer
-	now func() time.Time
-	ids *IDSource
+	mu       sync.Mutex
+	w        io.Writer
+	now      func() time.Time
+	ids      *IDSource
+	quiesced bool
+	dropped  int64
 }
 
 // NewWriter returns a writer to w. now may be nil.
@@ -254,16 +260,42 @@ func (w *Writer) Encode(typ string, payload any) ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// Emit writes one event line.
-func (w *Writer) Emit(typ string, payload any) error {
+// Emit writes one event line. After Quiesce it writes nothing and returns
+// ErrQuiesced.
+func (w *Writer) Emit(typ string, payload any) error { return w.emit(typ, payload, false) }
+
+// EmitFinal writes one event line even after Quiesce. Only the shutdown
+// sequence uses it, for its own last lines (PROTOCOL.md §6.11).
+func (w *Writer) EmitFinal(typ string, payload any) error { return w.emit(typ, payload, true) }
+
+func (w *Writer) emit(typ string, payload any, final bool) error {
 	line, err := w.Encode(typ, payload)
 	if err != nil {
 		return err
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.quiesced && !final {
+		w.dropped++
+		return ErrQuiesced
+	}
 	_, err = w.w.Write(line)
 	return err
+}
+
+// Quiesce closes the stream to everything but EmitFinal (review R-M1). A line
+// already being written finishes first; no Emit writes after Quiesce returns.
+func (w *Writer) Quiesce() {
+	w.mu.Lock()
+	w.quiesced = true
+	w.mu.Unlock()
+}
+
+// Dropped returns how many lines Emit has dropped since Quiesce.
+func (w *Writer) Dropped() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dropped
 }
 
 // EncodedSize returns the JSON size of v (used to size history batches).

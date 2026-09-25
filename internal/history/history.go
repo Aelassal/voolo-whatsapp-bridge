@@ -35,9 +35,13 @@ func NewWindow(size int) *Window {
 }
 
 // Acquire waits until fewer than size batches are unacknowledged, then
-// reserves and returns the next seq.
+// reserves and returns the next seq. A cancelled ctx gets no seq, even when
+// the window has room (review R-M1).
 func (w *Window) Acquire(ctx context.Context) (int64, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		w.mu.Lock()
 		if len(w.outstanding) < w.size {
 			seq := w.next
