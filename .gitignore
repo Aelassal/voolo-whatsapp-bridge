@@ -1,0 +1,5 @@
+/dist/
+/voolo-whatsapp-bridge
+*.exe
+*.test
+*.out
