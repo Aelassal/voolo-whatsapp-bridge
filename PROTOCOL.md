@@ -89,7 +89,7 @@ Examples of every event are in `examples/bridge-to-app/`. Optional fields are ma
 ### 5.1 `hello`
 First line the bridge writes.
 `{bridge: "voolo-whatsapp-bridge", version: "<semver>", protocol: 1, os: "windows|darwin|linux", arch: "amd64|arm64", features?: [string]}`
-*(rev 2)* `features?: string[]`: what this bridge offers beyond the first release of v1. A client MUST NOT send a command or a field that belongs to a feature the bridge did not list; an older bridge lists none (and answers a new command with `unknown_command`). Names so far: `reply_context` (§6.5, §6.6 quote fields), `forward` (§6.5, §6.6 `forwarded`), `send_video` (§6.1 `videoMaxBytes`/`fileMaxBytes`, §6.6 `kind: video`), `fetch_all_media` (§6.8 videos, stickers, documents, audio).
+*(rev 2)* `features?: string[]`: what this bridge offers beyond the first release of v1. A client MUST NOT send a command or a field that belongs to a feature the bridge did not list; an older bridge lists none (and answers a new command with `unknown_command`). Names so far: `reply_context` (§6.5, §6.6 quote fields), `forward` (§6.5, §6.6 `forwarded`), `send_video` (§6.1 `videoMaxBytes`/`fileMaxBytes`, §6.6 `kind: video`), `fetch_all_media` (§6.8 videos, stickers, documents, audio), `set_pin` (§6.12).
 *(review)* `version` is `MAJOR.MINOR.PATCH` without a leading `v` (a development build says `0.0.0-dev`). Versions are compared as three numbers, never with a `v` and never as strings, for example against `flags.json` `maxBridgeVersion` (§11) and release tags (§13).
 
 ### 5.2 `ready` (reply to `init`)
@@ -218,11 +218,12 @@ Examples of every command are in `examples/app-to-bridge/`. Commands are decoded
 | `send_media` | §6.6 | `send_result` | 60 s |
 | `mark_read` | §6.7 | `ok` | 30 s |
 | `fetch_media` | `{chatJid, messageId}` | `media_ready` | 120 s |
+| `set_pin` *(rev 2)* | `{chatJid, pinned}` | `ok` | 30 s |
 | `ack` | `{seq}` | none | — |
 | `ping` | `{}` | `pong` | 30 s |
 | `shutdown` | `{}` | `ok`, then exit 0 | 3 s |
 
-There are **no** other commands. In particular there is no command to send to several chats, to schedule, to repeat, to use a template, to broadcast, to change presence, to read the address book, to manage groups or to post a status. None will be added.
+There are **no** other commands *(rev 2: besides `set_pin` and `fetch_avatar`, §6.12, §6.13, announced in `hello.features`)*. In particular there is no command to send to several chats, to schedule, to repeat, to use a template, to broadcast, to change presence, to read the address book, to manage groups or to post a status. None will be added.
 
 ### 6.1 `init`
 ```
@@ -298,6 +299,9 @@ Liveness. A client SHOULD ping every 30 s and restart the bridge after two misse
 ### 6.11 `shutdown`
 The bridge disconnects, flushes and closes the store, replies `ok` and exits with code 0 within 3 s. The same happens on stdin EOF (without the reply).
 - *(re-review)* **Once the bridge begins to stop** (`shutdown`, stdin EOF, a fatal error, a logout), stdout carries nothing but its final lines, in this order: `error {store_io}` (only if a store deletion failed, §6.4), `logged_out` (after a logout), `status {stopped}`, `ok` for a `logout` command, and `ok` for `shutdown`. Everything else is dropped (counted on stderr as `emit_dropped`): no more history, messages, receipts or replies. A command still running then gets **no reply**. A `send_text` or `send_media` without a reply MUST be treated as `timeout` (it may or may not have been sent; its `outboxId` is used).
+
+### 6.12 `set_pin` *(rev 2, feature `set_pin`)*
+`{chatJid, pinned: bool}`. Pins (`true`) or unpins (`false`) one chat in WhatsApp's app state, so the phone and every other linked device show the change; the change comes back as `chat_update {pinned}` like one made on the phone. It sends no message and no presence. Checks, in order: `not_paired`, `not_connected`, `unknown_chat` (as for sends, §6.5), then its own compiled-in backstop — at least **1 s** between two `set_pin`s and at most **20 in any 10 minutes** — else `error {rate_limited_local, retryable: true}` and nothing is written. Other errors: `timeout`, `internal`. Never repeated by the bridge. WhatsApp's apps keep at most three pinned chats; the bridge does not count them (a client SHOULD refuse a fourth pin itself).
 
 ## 7. History and flow control
 
@@ -408,7 +412,7 @@ Events, by area:
 | process and stdio | `started`, `stdin_eof`, `shutdown`, `init_timeout`, `line_dropped` (`code` `too_long` or `invalid`, `n` the count), `emit_failed`, `emit_dropped` (*(re-review)* a line dropped because the bridge is stopping, §6.11; `code` its event type, `n` the count), `panic`, `panic_recovered`, `stop_timeout`, `exit_logged_out` |
 | init and store | `ready`, `fatal`, `store_open_failed`, `store_close_failed`, `store_wiped`, `store_wipe_failed`, `store_write_failed`, `media_prune_failed`, `media_stale_deleted` |
 | connection and pairing | `status`, `signal`, `connect_failed`, `host_blocked`, `logged_out`, `pairing_started`, `pairing_failed`, `pairing_timeout`, `paired`, `version_refreshed`, `version_refresh_failed` |
-| commands | `command_refused`, `send_ok`, `send_failed`, `send_refused`, `send_clock_skew` (*(re-review)* send times after the clock were moved back, §6.5; `n` how many), `fetch_failed`, `group_info_failed`, `joined_groups_failed` |
+| commands | `command_refused`, `send_ok`, `send_failed`, `send_refused`, `send_clock_skew` (*(re-review)* send times after the clock were moved back, §6.5; `n` how many), `fetch_failed`, `group_info_failed`, `joined_groups_failed`; *(rev 2)* `pin_ok`, `pin_failed` |
 | history | `history_capped`, `history_done`, `history_download_failed` |
 | library | `whatsmeow` |
 

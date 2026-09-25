@@ -76,6 +76,7 @@ func init() {
 		"pairing_started", "pairing_failed", "pairing_timeout", "paired",
 		"version_refreshed", "version_refresh_failed",
 		"send_ok", "send_failed", "send_refused", "send_clock_skew", "fetch_failed",
+		"pin_ok", "pin_failed", // revision 2 (set_pin)
 		"group_info_failed", "joined_groups_failed",
 		"history_capped", "history_done", "history_download_failed",
 		// whatsmeow's own warnings and errors (constant format string as code)

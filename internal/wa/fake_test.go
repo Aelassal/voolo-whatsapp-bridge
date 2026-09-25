@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
@@ -65,6 +66,9 @@ type fakeClient struct {
 
 	history map[*waE2E.HistorySyncNotification]*waHistorySync.HistorySync
 	dlHist  int
+
+	patches  []appstate.PatchInfo
+	patchErr error
 
 	pairPhones []string
 	pairNames  []string
@@ -263,6 +267,16 @@ func (f *fakeClient) GetGroupInfo(ctx context.Context, j types.JID) (*types.Grou
 		}
 	}
 	return nil, whatsmeow.ErrGroupNotFound
+}
+
+func (f *fakeClient) SendAppState(_ context.Context, p appstate.PatchInfo) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.patchErr != nil {
+		return f.patchErr
+	}
+	f.patches = append(f.patches, p)
+	return nil
 }
 
 func (f *fakeClient) Account() AccountInfo { f.mu.Lock(); defer f.mu.Unlock(); return f.account }

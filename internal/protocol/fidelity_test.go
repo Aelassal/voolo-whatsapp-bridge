@@ -124,3 +124,19 @@ func TestVideoKindAndLimits(t *testing.T) {
 		t.Fatal("send_video not announced")
 	}
 }
+
+func TestSetPinStrict(t *testing.T) {
+	for payload, ok := range map[string]bool{
+		`{"chatJid":"15550100002@s.whatsapp.net","pinned":true}`:                true,
+		`{"chatJid":"120363000000000001@g.us","pinned":false}`:                  true,
+		`{"chatJid":"15550100002@s.whatsapp.net"}`:                              false,
+		`{"chatJid":"status@broadcast","pinned":true}`:                          false,
+		`{"chatJids":["15550100002@s.whatsapp.net"],"pinned":true}`:             false,
+		`{"chatJid":"15550100002@s.whatsapp.net","pinned":true,"archive":true}`: false,
+		`{"chatJid":"15550100002@s.whatsapp.net","pinned":"true"}`:              false,
+	} {
+		if err := cmd(CmdSetPin, payload); (err == nil) != ok {
+			t.Errorf("%s: %v", payload, err)
+		}
+	}
+}

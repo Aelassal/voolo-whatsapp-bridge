@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
@@ -51,6 +52,8 @@ type Client interface {
 	DeleteMedia(ctx context.Context, appInfo whatsmeow.MediaType, directPath string, encFileHash []byte, encHandle string) error
 	GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, error)
 	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
+	// SendAppState writes one app-state patch (set_pin, revision 2).
+	SendAppState(ctx context.Context, patch appstate.PatchInfo) error
 
 	Account() AccountInfo
 	PNForLID(ctx context.Context, lid types.JID) types.JID

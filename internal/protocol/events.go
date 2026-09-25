@@ -49,11 +49,12 @@ const (
 	FeatureForward      = "forward"
 	FeatureSendVideo    = "send_video"
 	FeatureFetchAll     = "fetch_all_media"
+	FeatureSetPin       = "set_pin"
 )
 
 // Features returns the features this bridge offers.
 func Features() []string {
-	return []string{FeatureReplyContext, FeatureForward, FeatureSendVideo, FeatureFetchAll}
+	return []string{FeatureReplyContext, FeatureForward, FeatureSendVideo, FeatureFetchAll, FeatureSetPin}
 }
 
 // Account is ready.account.

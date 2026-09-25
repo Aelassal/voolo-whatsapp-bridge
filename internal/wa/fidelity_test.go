@@ -5,12 +5,14 @@ package wa
 
 import (
 	"bytes"
+	"errors"
 	"image"
 	"image/jpeg"
 	"testing"
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -245,4 +247,60 @@ func TestDownloadTypes(t *testing.T) {
 			t.Errorf("%s: %s", kind, got)
 		}
 	}
+}
+
+// Feature set_pin: one app-state patch per user action, for a reported chat,
+// under its own backstop; errors mapped, nothing repeated.
+func TestSetPin(t *testing.T) {
+	h := newHarness(t, pairedFake)
+	f := h.initPairedConnected()
+	h.expectError(h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": true}), protocol.ErrUnknownChat)
+	h.knownChat(f)
+	id := h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": true})
+	if reply(h.expect(protocol.EvOK)) != id {
+		t.Fatal("ok replyTo")
+	}
+	f.mu.Lock()
+	p := f.patches[0]
+	f.mu.Unlock()
+	if len(p.Mutations) != 1 || p.Mutations[0].Index[0] != appstate.IndexPin || p.Mutations[0].Index[1] != alice ||
+		!p.Mutations[0].Value.GetPinAction().GetPinned() {
+		t.Fatalf("patch %+v", p)
+	}
+	// Within a second: refused, nothing written.
+	h.expectError(h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": false}), protocol.ErrRateLimitedLocal)
+	h.advance(time.Second)
+	h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": false})
+	h.expect(protocol.EvOK)
+	f.mu.Lock()
+	if len(f.patches) != 2 || f.patches[1].Mutations[0].Value.GetPinAction().GetPinned() {
+		t.Fatalf("unpin %+v", f.patches)
+	}
+	f.mu.Unlock()
+	// At most 20 in ten minutes.
+	for range 18 {
+		h.advance(time.Second)
+		h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": true})
+		h.expect(protocol.EvOK)
+	}
+	h.advance(time.Second)
+	h.expectError(h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": true}), protocol.ErrRateLimitedLocal)
+	h.advance(10 * time.Minute)
+	f.mu.Lock()
+	f.patchErr = whatsmeow.ErrIQTimedOut
+	f.mu.Unlock()
+	h.expectError(h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": true}), protocol.ErrTimeout)
+	h.advance(time.Second)
+	f.mu.Lock()
+	f.patchErr = errors.New("server said no")
+	f.mu.Unlock()
+	h.expectError(h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": true}), protocol.ErrInternal)
+	f.mu.Lock()
+	n := len(f.patches)
+	f.mu.Unlock()
+	if n != 20 {
+		t.Fatalf("patches written %d", n)
+	}
+	f.Disconnect()
+	h.expectError(h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": true}), protocol.ErrNotConnected)
 }

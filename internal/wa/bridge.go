@@ -118,6 +118,7 @@ type Bridge struct {
 	outdated  int         // ClientOutdated events seen
 	loggedOut *logoutInfo // set once the account is unlinked; Stop wipes the store
 	sends     []time.Time // reservation times of recent sends, oldest first (send backstop)
+	pins      []time.Time // times of recent set_pin writes (their own backstop, rev 2)
 
 	sending  atomic.Bool
 	fetchSem chan struct{}
@@ -272,6 +273,8 @@ func (b *Bridge) Handle(env protocol.Envelope) (shutdown bool) {
 		b.asyncCmd(id, func() { b.markRead(id, c) })
 	case *protocol.FetchMedia:
 		b.asyncCmd(id, func() { b.fetchMedia(id, c) })
+	case *protocol.SetPin:
+		b.asyncCmd(id, func() { b.setPin(id, c) })
 	case *protocol.Empty:
 		switch env.Type {
 		case protocol.CmdPing:

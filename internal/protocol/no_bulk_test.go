@@ -14,7 +14,8 @@ import (
 func TestCommandSetIsExactlyV1(t *testing.T) {
 	got := Commands()
 	sort.Strings(got)
-	want := []string{"ack", "fetch_media", "init", "logout", "mark_read", "pair_phone", "pair_qr", "ping", "send_media", "send_text", "shutdown"}
+	// Revision 2 added set_pin (one chat, the user's action) and nothing that sends.
+	want := []string{"ack", "fetch_media", "init", "logout", "mark_read", "pair_phone", "pair_qr", "ping", "send_media", "send_text", "set_pin", "shutdown"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("command set changed:\n got %v\nwant %v", got, want)
 	}

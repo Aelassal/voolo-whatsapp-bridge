@@ -25,9 +25,11 @@ const (
 	CmdSendMedia  = "send_media"
 	CmdMarkRead   = "mark_read"
 	CmdFetchMedia = "fetch_media"
-	CmdAck        = "ack"
-	CmdPing       = "ping"
-	CmdShutdown   = "shutdown"
+	// Revision 2 (PROTOCOL.md §6.12): pin or unpin one chat, on the user's action.
+	CmdSetPin   = "set_pin"
+	CmdAck      = "ack"
+	CmdPing     = "ping"
+	CmdShutdown = "shutdown"
 )
 
 // Ceilings the bridge enforces whatever the client asks for (§6.1, ADR-012 S5
@@ -160,6 +162,12 @@ type FetchMedia struct {
 	MessageID string `json:"messageId"`
 }
 
+// SetPin is the set_pin payload (revision 2, feature set_pin).
+type SetPin struct {
+	ChatJID string `json:"chatJid"`
+	Pinned  bool   `json:"pinned"`
+}
+
 // Ack is the ack payload.
 type Ack struct {
 	Seq int64 `json:"seq"`
@@ -195,6 +203,7 @@ var commandSpecs = map[string]commandSpec{
 	CmdMarkRead:   {fields: fieldSpec{"chatJid": true, "messageIds": true, "senderJid": false}, decode: decodeAs[MarkRead]},
 	CmdFetchMedia: {fields: fieldSpec{"chatJid": true, "messageId": true}, decode: decodeAs[FetchMedia]},
 	CmdAck:        {fields: fieldSpec{"seq": true}, decode: decodeAs[Ack]},
+	CmdSetPin:     {fields: fieldSpec{"chatJid": true, "pinned": true}, decode: decodeAs[SetPin]},
 	CmdPing:       {fields: fieldSpec{}, decode: decodeAs[Empty]},
 	CmdShutdown:   {fields: fieldSpec{}, decode: decodeAs[Empty]},
 }
@@ -490,6 +499,10 @@ func validate(v any) error {
 	case *FetchMedia:
 		if !IsChatJID(c.ChatJID) || !IsMessageID(c.MessageID) {
 			return bad("fetch_media")
+		}
+	case *SetPin:
+		if !IsChatJID(c.ChatJID) {
+			return bad("set_pin")
 		}
 	case *Ack:
 		if c.Seq < 1 {

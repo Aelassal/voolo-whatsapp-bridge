@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
@@ -492,6 +493,64 @@ func voiceDuration(declared, file int) int {
 		return max(declared, file)
 	}
 	return file
+}
+
+// The set_pin backstop (PROTOCOL.md §6.12): compiled in, like the send one.
+const (
+	MinPinInterval  = time.Second
+	MaxPinsInWindow = 20
+	PinWindow       = 10 * time.Minute
+)
+
+// pinAllowed reports whether a set_pin may write now, and records it.
+func (b *Bridge) pinAllowed(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	keep := b.pins[:0]
+	for _, t := range b.pins {
+		if d := now.Sub(t); d >= 0 && d < PinWindow {
+			keep = append(keep, t)
+		}
+	}
+	b.pins = keep
+	if len(keep) >= MaxPinsInWindow || (len(keep) > 0 && now.Sub(keep[len(keep)-1]) < MinPinInterval) {
+		return false
+	}
+	b.pins = append(b.pins, now)
+	return true
+}
+
+// setPin pins or unpins one reported chat in WhatsApp's app state, so the
+// phone and every linked device show it (revision 2, feature set_pin). It is
+// never repeated by the bridge.
+func (b *Bridge) setPin(id string, c *protocol.SetPin) {
+	s, ok := b.ready(id)
+	if !ok {
+		return
+	}
+	jid, err := types.ParseJID(c.ChatJID)
+	if err != nil || !b.knownChat(c.ChatJID) {
+		b.fail(id, protocol.ErrUnknownChat)
+		return
+	}
+	if !b.pinAllowed(b.cfg.Now()) {
+		b.fail(id, protocol.ErrRateLimitedLocal)
+		b.cfg.Log.Warn("pin_failed", logx.Code(protocol.ErrRateLimitedLocal))
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, 25*time.Second)
+	defer cancel()
+	if err := s.cli.SendAppState(ctx, appstate.BuildPin(jid, c.Pinned)); err != nil {
+		code := SendErrorCode(err)
+		if code == protocol.ErrSendFailed {
+			code = protocol.ErrInternal
+		}
+		b.fail(id, code)
+		b.cfg.Log.Warn("pin_failed", logx.Code(code))
+		return
+	}
+	b.emit(protocol.EvOK, protocol.Reply{ReplyTo: id})
+	b.cfg.Log.Info("pin_ok")
 }
 
 func (b *Bridge) logout(id string) {
