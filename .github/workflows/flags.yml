@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Signs and publishes flags.json (PROTOCOL.md §11) to the "flags" prerelease.
+# Manual only. It runs in the protected "flags" environment, so every run
+# waits for the owner's approval before the signing key is available.
+name: flags
+
+on:
+  workflow_dispatch:
+    inputs:
+      enabled:
+        description: "deepSync.enabled"
+        type: boolean
+        required: true
+      maxBridgeVersion:
+        description: "deepSync.maxBridgeVersion (MAJOR.MINOR.PATCH)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flags
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: flags
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: false
+      - name: sign
+        env:
+          FLAGS_ED25519_PRIVATE_KEY: ${{ secrets.FLAGS_ED25519_PRIVATE_KEY }}
+          ENABLED: ${{ inputs.enabled }}
+          MAX_VERSION: ${{ inputs.maxBridgeVersion }}
+        run: |
+          go run ./cmd/flags-sign -enabled="$ENABLED" -max-bridge-version="$MAX_VERSION" -out flags.json
+          go run ./cmd/flags-sign -verify flags.json
+      - name: publish to the flags prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view flags --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create flags --repo "$GITHUB_REPOSITORY" --prerelease --latest=false --target "$GITHUB_SHA" \
+              --title "flags" --notes "Signed pause switch for clients (PROTOCOL.md §11). Not a program release."
+          fi
+          gh release upload flags flags.json --repo "$GITHUB_REPOSITORY" --clobber

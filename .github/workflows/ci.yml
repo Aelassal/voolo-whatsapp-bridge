@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (linux, race)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: go vet
+        run: go vet ./...
+      - name: go mod verify
+        run: go mod verify
+      - name: test
+        run: go test -race -count=1 ./...
+      - name: cross-compile the four release targets
+        run: scripts/build-release.sh 0.0.0 dist
+      - name: licence check
+        run: |
+          go install github.com/google/go-licenses@v1.6.0
+          # go-sqlite3-wasm is MIT-0, which the classifier does not know (licenses/README.md).
+          "$(go env GOPATH)/bin/go-licenses" check ./cmd/voolo-whatsapp-bridge \
+            --allowed_licenses=GPL-3.0,MPL-2.0,MIT,ISC,Apache-2.0,BSD-2-Clause,BSD-3-Clause \
+            --ignore github.com/ncruces/go-sqlite3-wasm/v6
+
+  test-other-os:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+      - name: test
+        run: go test -count=1 ./...

@@ -4,7 +4,7 @@ A small command-line program that links to a WhatsApp account as a **linked devi
 
 It is built on [whatsmeow](https://github.com/tulir/whatsmeow). Anyone can use it: a shell, a script or a desktop app can pair it, read chats and history, and send messages one at a time, using only [`PROTOCOL.md`](PROTOCOL.md).
 
-> **Status (2026-09-25):** design published; code lands in the next step (task P1-A). `PROTOCOL.md` and `examples/` are the agreed interface.
+> **Status (2026-09-25):** first implementation (task P1-A), not yet released and not yet tried on a real account. `PROTOCOL.md` and `examples/` are the agreed interface.
 
 ## Licence
 
@@ -31,37 +31,38 @@ Requirements: Go 1.26 or newer (releases use Go 1.27.1). No C compiler is needed
 
 ```sh
 # local build for this machine
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags)" \
-  -o voolo-whatsapp-bridge ./cmd/voolo-whatsapp-bridge
+CGO_ENABLED=0 go build -trimpath -o voolo-whatsapp-bridge ./cmd/voolo-whatsapp-bridge
 
-# cross-compile (what the release workflow does)
-for t in windows/amd64 darwin/arm64 darwin/amd64 linux/amd64; do
-  GOOS=${t%/*} GOARCH=${t#*/} CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$V" \
-    -o dist/voolo-whatsapp-bridge_${V}_${t%/*}_${t#*/}$([ ${t%/*} = windows ] && echo .exe) ./cmd/voolo-whatsapp-bridge
-done
+# the four release binaries and SHA256SUMS, exactly as the release workflow builds them
+# (CGO_ENABLED=0, -trimpath, -buildvcs=false, -ldflags "-s -w -buildid= -X main.version=$V")
+scripts/build-release.sh 0.1.0 dist
 
-go test ./...
+go test ./...          # nothing in the tests connects to WhatsApp: a fake stands in for it
+go test -race ./...    # needs a C compiler for the race detector only
 ```
 
-Releases are built by GitHub Actions from a signed tag `vX.Y.Z`. Each release publishes one binary per platform (win-x64, mac-arm64, mac-x64, linux-x64), `SHA256SUMS`, the `go-licenses` report and a build-provenance attestation. A second job rebuilds from the tag and compares the hashes, so a release is reproducible from its source. OS code signing (Authenticode, Developer ID + notarization) will be added later.
+Releases are built by GitHub Actions (`.github/workflows/release.yml`) from a tag `vX.Y.Z`. Each release publishes one binary per platform (win-x64, mac-arm64, mac-x64, linux-x64), `SHA256SUMS`, the `go-licenses` report and a build-provenance attestation. A second job rebuilds from the tag and compares the hashes, so a release is reproducible from its source. OS code signing (Authenticode, Developer ID + notarization) will be added later.
 
 ## Trying it from a shell
 
 See `PROTOCOL.md` §12. In short: start the program, read its `hello` line, send an `init` line with a key and folders, send `pair_qr`, turn the `qr` code into a QR image with any tool, scan it with your phone in WhatsApp → Settings → Linked devices, and watch `paired`, `chat` and `message` lines arrive.
 
-## Layout (from P1-A)
+## Layout
 
 ```
 cmd/voolo-whatsapp-bridge/   main: stdio loop, handshake, flags --version/--license/--source
-cmd/flags-sign/              signs flags.json (used by the flags workflow)
+cmd/flags-sign/              signs flags.json (used only by the flags workflow)
 internal/protocol/           envelope, strict command decoding, event encoding
 internal/store/              encrypted SQLite store, file lock, bridge tables
 internal/transport/          host allowlist for every HTTP/WebSocket connection
 internal/wa/                 whatsmeow client, event mapping, pairing, sending
 internal/history/            history batches and flow control
-internal/media/              on-demand media download and hand-off
+internal/media/              media hand-off files and size caps
 internal/logx/               content-free stderr diagnostics
+licenses/                    go-licenses report of the linked modules
+scripts/build-release.sh     reproducible build of the four release binaries
 examples/                    one example line per message type (CC0)
+.github/workflows/           ci (every push), release (tags v*), flags (manual, protected)
 ```
 
 ## Disclaimer

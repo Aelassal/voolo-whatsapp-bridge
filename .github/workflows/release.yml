@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Builds a release from a tag vX.Y.Z: four binaries, SHA256SUMS, the licence
+# report and a build-provenance attestation. A second job rebuilds from the
+# same tag on a fresh runner and must produce identical hashes before anything
+# is published.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: false
+      - name: test
+        run: go test -count=1 ./...
+      - name: build
+        run: scripts/build-release.sh "${GITHUB_REF_NAME#v}" dist
+      - name: licence report
+        run: |
+          go install github.com/google/go-licenses@v1.6.0
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 "$(go env GOPATH)/bin/go-licenses" report ./cmd/voolo-whatsapp-bridge > dist/go-licenses.csv
+          cp licenses/README.md dist/go-licenses-README.md
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/voolo-whatsapp-bridge_*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  reproduce:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.1"
+          cache: false
+      - name: rebuild
+        run: scripts/build-release.sh "${GITHUB_REF_NAME#v}" rebuild
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+      - name: compare hashes
+        run: diff dist/SHA256SUMS rebuild/SHA256SUMS
+
+  publish:
+    needs: [build, reproduce]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" \
+            --notes "Binaries for win-x64, mac-arm64, mac-x64 and linux-x64, built reproducibly from tag $TAG (see SHA256SUMS). Licence: GPL-3.0-or-later. Source: https://github.com/$GITHUB_REPOSITORY/tree/$TAG"
