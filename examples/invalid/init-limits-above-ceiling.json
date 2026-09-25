@@ -1,0 +1,1 @@
+{"v":1,"id":"01M3C03X2Z4BSP7QWB9FR3V4FS","type":"init","ts":1790330400000,"payload":{"storeKey":"0000000000000000000000000000000000000000000000000000000000000001","storeDir":"/tmp/s","mediaDir":"/tmp/m","deviceName":"Voolo","limits":{"historyDays":365,"historyMaxPerChat":100000,"imageMaxBytes":2097152,"voiceMaxSeconds":300}}}
