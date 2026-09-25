@@ -116,7 +116,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer, d deps) (code
 	}
 	b = wa.New(cfg)
 
-	if err := out.Emit(protocol.EvHello, protocol.Hello{Bridge: "voolo-whatsapp-bridge", Version: bareVersion(), Protocol: protocol.Version, OS: runtime.GOOS, Arch: runtime.GOARCH}); err != nil {
+	if err := out.Emit(protocol.EvHello, protocol.Hello{Bridge: "voolo-whatsapp-bridge", Version: bareVersion(), Protocol: protocol.Version, OS: runtime.GOOS, Arch: runtime.GOARCH, Features: protocol.Features()}); err != nil {
 		return wa.ExitCrash
 	}
 	log.Info("started")

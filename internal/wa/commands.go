@@ -197,13 +197,27 @@ func (b *Bridge) deliver(s *session, id, outboxID string, to types.JID, msg *waE
 	b.cfg.Log.Info("send_ok")
 }
 
-func (b *Bridge) contextInfo(chat, quotedID string) *waE2E.ContextInfo {
-	if quotedID == "" {
+// contextInfo is the reply part of a send (PROTOCOL.md §6.5, revision 2):
+// the quoted message's id, its author and a copy of its text. The author is
+// the JID WhatsApp gave for that message when the bridge saw it (a group may
+// address people by @lid), else the client's quotedSenderJid, else the
+// reported sender. The copy is what WhatsApp's clients show above the reply;
+// it goes only to the chat that already holds the quoted message.
+func (b *Bridge) contextInfo(chat string, q protocol.Quote) *waE2E.ContextInfo {
+	if q.QuotedMessageID == "" {
 		return nil
 	}
-	ci := &waE2E.ContextInfo{StanzaID: proto.String(quotedID)}
-	if p, ok := b.senders.get(chat + "|" + quotedID); ok {
+	ci := &waE2E.ContextInfo{StanzaID: proto.String(q.QuotedMessageID)}
+	key := chat + "|" + q.QuotedMessageID
+	if p, ok := b.rawSenders.get(key); ok {
 		ci.Participant = proto.String(p)
+	} else if q.QuotedSenderJID != "" {
+		ci.Participant = proto.String(q.QuotedSenderJID)
+	} else if p, ok := b.senders.get(key); ok {
+		ci.Participant = proto.String(p)
+	}
+	if q.QuotedText != "" {
+		ci.QuotedMessage = &waE2E.Message{Conversation: proto.String(q.QuotedText)}
 	}
 	return ci
 }
@@ -215,7 +229,7 @@ func (b *Bridge) sendText(id string, c *protocol.SendText) {
 	}
 	defer release()
 	msg := &waE2E.Message{}
-	if ci := b.contextInfo(c.ChatJID, c.QuotedMessageID); ci != nil {
+	if ci := b.contextInfo(c.ChatJID, c.Quote); ci != nil {
 		msg.ExtendedTextMessage = &waE2E.ExtendedTextMessage{Text: proto.String(c.Text), ContextInfo: ci}
 	} else {
 		msg.Conversation = proto.String(c.Text)
@@ -285,7 +299,7 @@ func (b *Bridge) sendMedia(id string, c *protocol.SendMedia) {
 		b.fail(id, code)
 		return
 	}
-	ci := b.contextInfo(c.ChatJID, "")
+	ci := b.contextInfo(c.ChatJID, c.Quote)
 	msg := &waE2E.Message{}
 	switch c.Kind {
 	case "image":
@@ -301,7 +315,7 @@ func (b *Bridge) sendMedia(id string, c *protocol.SendMedia) {
 	case "voice":
 		msg.AudioMessage = &waE2E.AudioMessage{Mimetype: proto.String(c.Mime), URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath),
 			MediaKey: up.MediaKey, FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
-			PTT: proto.Bool(true), Seconds: proto.Uint32(uint32(secs))}
+			PTT: proto.Bool(true), Seconds: proto.Uint32(uint32(secs)), ContextInfo: ci}
 	default:
 		name := c.FileName
 		if name == "" {
@@ -312,7 +326,7 @@ func (b *Bridge) sendMedia(id string, c *protocol.SendMedia) {
 		}
 		dm := &waE2E.DocumentMessage{Mimetype: proto.String(c.Mime), URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath),
 			MediaKey: up.MediaKey, FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
-			FileName: proto.String(name), Title: proto.String(name)}
+			FileName: proto.String(name), Title: proto.String(name), ContextInfo: ci}
 		if c.Caption != "" {
 			dm.Caption = proto.String(c.Caption)
 		}

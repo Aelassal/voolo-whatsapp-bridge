@@ -48,6 +48,9 @@ const (
 	MaxFileNameChars     = 255
 	MaxCaptionChars      = 65536
 	DefaultVoiceMaxBytes = MaxVoiceBytes
+	// MaxQuotedTextChars caps the copy of a quoted message sent with a reply
+	// (revision 2, PROTOCOL.md §6.5).
+	MaxQuotedTextChars = 4096
 )
 
 // Limits is init.limits.
@@ -82,12 +85,21 @@ type PairPhone struct {
 	Phone string `json:"phone"`
 }
 
+// Quote is the reply part of send_text and send_media (revision 2): the
+// quoted message's id, and optionally its author and a copy of its text, which
+// WhatsApp's clients show above the reply.
+type Quote struct {
+	QuotedMessageID string `json:"quotedMessageId,omitempty"`
+	QuotedSenderJID string `json:"quotedSenderJid,omitempty"`
+	QuotedText      string `json:"quotedText,omitempty"`
+}
+
 // SendText is the send_text payload.
 type SendText struct {
-	ChatJID         string `json:"chatJid"`
-	Text            string `json:"text"`
-	OutboxID        string `json:"outboxId"`
-	QuotedMessageID string `json:"quotedMessageId,omitempty"`
+	ChatJID  string `json:"chatJid"`
+	Text     string `json:"text"`
+	OutboxID string `json:"outboxId"`
+	Quote
 }
 
 // SendMedia is the send_media payload.
@@ -101,6 +113,7 @@ type SendMedia struct {
 	Mime     string `json:"mime"`
 	Caption  string `json:"caption,omitempty"`
 	FileName string `json:"fileName,omitempty"`
+	Quote
 }
 
 // MarkRead is the mark_read payload.
@@ -141,16 +154,23 @@ var commandSpecs = map[string]commandSpec{
 		nested: map[string]fieldSpec{"limits": limitsSpec},
 		decode: decodeAs[Init],
 	},
-	CmdPairQR:     {fields: fieldSpec{}, decode: decodeAs[Empty]},
-	CmdPairPhone:  {fields: fieldSpec{"phone": true}, decode: decodeAs[PairPhone]},
-	CmdLogout:     {fields: fieldSpec{}, decode: decodeAs[Empty]},
-	CmdSendText:   {fields: fieldSpec{"chatJid": true, "text": true, "outboxId": true, "quotedMessageId": false}, decode: decodeAs[SendText]},
-	CmdSendMedia:  {fields: fieldSpec{"chatJid": true, "outboxId": true, "kind": true, "path": true, "key": true, "sha256": true, "mime": true, "caption": false, "fileName": false}, decode: decodeAs[SendMedia]},
+	CmdPairQR:    {fields: fieldSpec{}, decode: decodeAs[Empty]},
+	CmdPairPhone: {fields: fieldSpec{"phone": true}, decode: decodeAs[PairPhone]},
+	CmdLogout:    {fields: fieldSpec{}, decode: decodeAs[Empty]},
+	CmdSendText:  {fields: withQuote(fieldSpec{"chatJid": true, "text": true, "outboxId": true}), decode: decodeAs[SendText]},
+	CmdSendMedia: {fields: withQuote(fieldSpec{"chatJid": true, "outboxId": true, "kind": true, "path": true, "key": true, "sha256": true, "mime": true,
+		"caption": false, "fileName": false}), decode: decodeAs[SendMedia]},
 	CmdMarkRead:   {fields: fieldSpec{"chatJid": true, "messageIds": true, "senderJid": false}, decode: decodeAs[MarkRead]},
 	CmdFetchMedia: {fields: fieldSpec{"chatJid": true, "messageId": true}, decode: decodeAs[FetchMedia]},
 	CmdAck:        {fields: fieldSpec{"seq": true}, decode: decodeAs[Ack]},
 	CmdPing:       {fields: fieldSpec{}, decode: decodeAs[Empty]},
 	CmdShutdown:   {fields: fieldSpec{}, decode: decodeAs[Empty]},
+}
+
+// withQuote adds the optional reply fields of revision 2 to a send's fields.
+func withQuote(f fieldSpec) fieldSpec {
+	f["quotedMessageId"], f["quotedSenderJid"], f["quotedText"] = false, false, false
+	return f
 }
 
 // Commands returns the names of every v1 command.
@@ -329,6 +349,24 @@ func cleanAbs(p string) (string, bool) {
 	return filepath.Clean(p), true
 }
 
+// validQuote checks the reply fields: an author or a text only with the id
+// they belong to.
+func validQuote(q *Quote) error {
+	if q.QuotedMessageID != "" && !IsMessageID(q.QuotedMessageID) {
+		return bad("quotedMessageId")
+	}
+	if (q.QuotedSenderJID != "" || q.QuotedText != "") && q.QuotedMessageID == "" {
+		return bad("quote without quotedMessageId")
+	}
+	if q.QuotedSenderJID != "" && !IsUserJID(q.QuotedSenderJID) {
+		return bad("quotedSenderJid")
+	}
+	if q.QuotedText != "" && !textOK(q.QuotedText, 1, MaxQuotedTextChars) {
+		return bad("quotedText")
+	}
+	return nil
+}
+
 func validate(v any) error {
 	switch c := v.(type) {
 	case *Init:
@@ -361,8 +399,8 @@ func validate(v any) error {
 		if !IsChatJID(c.ChatJID) || !IsULID(c.OutboxID) || !textOK(c.Text, 1, MaxTextChars) {
 			return bad("send_text")
 		}
-		if c.QuotedMessageID != "" && !IsMessageID(c.QuotedMessageID) {
-			return bad("quotedMessageId")
+		if err := validQuote(&c.Quote); err != nil {
+			return err
 		}
 	case *SendMedia:
 		if !IsChatJID(c.ChatJID) || !IsULID(c.OutboxID) {
@@ -386,6 +424,9 @@ func validate(v any) error {
 		if c.FileName != "" && (!textOK(c.FileName, 1, MaxFileNameChars) || strings.ContainsAny(c.FileName, "/\\\x00") ||
 			c.FileName == "." || c.FileName == ".." || strings.IndexFunc(c.FileName, unicode.IsControl) >= 0) {
 			return bad("fileName")
+		}
+		if err := validQuote(&c.Quote); err != nil {
+			return err
 		}
 	case *MarkRead:
 		if !IsChatJID(c.ChatJID) || len(c.MessageIDs) < 1 || len(c.MessageIDs) > MaxMarkRead {

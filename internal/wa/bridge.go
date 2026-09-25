@@ -132,6 +132,7 @@ type Bridge struct {
 	groupCache   map[string]*types.GroupInfo
 	groupsLoaded bool
 	senders      *lru // "chat|id" → sender JID, for quoted replies
+	rawSenders   *lru // "chat|id" → the sender JID as WhatsApp addressed it (@lid in some groups)
 
 	wg sync.WaitGroup
 }
@@ -149,6 +150,7 @@ func New(cfg Config) *Bridge {
 		groupsSent: map[string]bool{},
 		groupCache: map[string]*types.GroupInfo{},
 		senders:    newLRU(10000),
+		rawSenders: newLRU(10000),
 	}
 }
 

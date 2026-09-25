@@ -38,6 +38,19 @@ type Hello struct {
 	Protocol int    `json:"protocol"`
 	OS       string `json:"os"`
 	Arch     string `json:"arch"`
+	// Features lists what this bridge offers beyond the first release of v1
+	// (revision 2, PROTOCOL.md §5.1). A client uses a feature only when listed.
+	Features []string `json:"features,omitempty"`
+}
+
+// Features of revision 2 (PROTOCOL.md §5.1), in the order they were added.
+const (
+	FeatureReplyContext = "reply_context"
+)
+
+// Features returns the features this bridge offers.
+func Features() []string {
+	return []string{FeatureReplyContext}
 }
 
 // Account is ready.account.

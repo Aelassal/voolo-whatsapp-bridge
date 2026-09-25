@@ -402,6 +402,9 @@ func (b *Bridge) toMessage(ctx context.Context, s *session, e *events.Message, c
 			FileSHA256: c.Keys.FileSHA256, FileEncSHA256: c.Keys.FileEncSHA256, MsgTS: m.TS}
 	}
 	b.senders.put(chat+"|"+m.ID, m.SenderJID)
+	if raw := e.Info.Sender.ToNonAD(); !raw.IsEmpty() && (raw.Server == types.DefaultUserServer || raw.Server == types.HiddenUserServer) {
+		b.rawSenders.put(chat+"|"+m.ID, raw.String())
+	}
 	return m, desc, true
 }
 
