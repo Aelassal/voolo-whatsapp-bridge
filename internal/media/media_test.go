@@ -150,7 +150,7 @@ func TestCleanStale(t *testing.T) {
 // S5 caps as amended by the owner: voice ≤ 60 min and ≤ 32 MiB, images ≤ 16 MiB,
 // checked before any download; boundary values on both sides.
 func TestFetchCaps(t *testing.T) {
-	l := Limits{ImageMaxBytes: 16 << 20, VoiceMaxSeconds: 3600, VoiceMaxBytes: 32 << 20}
+	l := Limits{ImageMaxBytes: 16 << 20, VoiceMaxSeconds: 3600, VoiceMaxBytes: 32 << 20, VideoMaxBytes: 64 << 20, FileMaxBytes: 100 << 20}
 	cases := []struct {
 		kind string
 		size int64
@@ -164,14 +164,21 @@ func TestFetchCaps(t *testing.T) {
 		{"voice", 1000, 3601, false},
 		{"voice", 32 << 20, 60, true},
 		{"voice", 32<<20 + 1, 60, false},
-		{"video", 10, 1, false},
-		{"document", 10, 0, false},
-		{"sticker", 10, 0, false},
-		{"audio", 10, 1, false},
+		// Revision 2 (fetch_all_media): videos, stickers, documents and audio.
+		{"video", 64 << 20, 1, true},
+		{"video", 64<<20 + 1, 1, false},
+		{"document", 100 << 20, 0, true},
+		{"document", 100<<20 + 1, 0, false},
+		{"audio", 100 << 20, 7200, true}, // audio files have no duration cap, only size
+		{"sticker", 16 << 20, 0, true},
+		{"sticker", 16<<20 + 1, 0, false},
+		{"image", -1, 0, false},
+		{"location", 10, 0, false},
+		{"unsupported", 10, 0, false},
 	}
 	for _, c := range cases {
 		err := CheckFetch(c.kind, c.size, c.dur, l)
-		if (err == nil) != c.ok || (Fetchable(c.kind) != (c.kind == "image" || c.kind == "voice")) {
+		if (err == nil) != c.ok || (Fetchable(c.kind) != (c.kind != "location" && c.kind != "unsupported")) {
 			t.Errorf("%+v: err=%v", c, err)
 		}
 	}

@@ -10,7 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/Aelassal/voolo-whatsapp-bridge/internal/protocol"
 )
@@ -175,5 +179,70 @@ func TestFileCapDefault(t *testing.T) {
 	h.b.mu.Unlock()
 	if lim.FileMaxBytes != 32<<20 || lim.VideoMaxBytes != 16<<20 {
 		t.Fatalf("limits %+v", lim)
+	}
+}
+
+// Feature fetch_all_media: videos, documents, stickers and audio files are
+// described with a download descriptor and fetched on request, each under its
+// own cap and with WhatsApp's media type for its keys.
+func TestFetchVideoDocumentSticker(t *testing.T) {
+	h := newHarness(t, pairedFake)
+	h.init(map[string]any{"historyDays": 90, "historyMaxPerChat": 20000, "imageMaxBytes": 1000, "voiceMaxSeconds": 3600,
+		"videoMaxBytes": 2000, "fileMaxBytes": 3000})
+	f := h.fake()
+	h.expectState(protocol.StateConnecting)
+	waitFor(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.connects > 0 })
+	f.dispatch(&events.Connected{})
+	h.expectState(protocol.StateConnected)
+	video := bytes.Repeat([]byte("v"), 1500)
+	doc := bytes.Repeat([]byte("d"), 2500)
+	sticker := []byte("RIFF....WEBPVP8 ")
+	f.downloads["/v/video"], f.downloads["/v/doc"], f.downloads["/v/sticker"] = video, doc, sticker
+	info := func(id string) types.MessageInfo {
+		return types.MessageInfo{MessageSource: types.MessageSource{Chat: mustParse(alice), Sender: mustParse(alice)}, ID: id, Timestamp: h.now}
+	}
+	f.dispatch(&events.Message{Info: info("3EB0VID"), Message: &waE2E.Message{VideoMessage: &waE2E.VideoMessage{Mimetype: proto.String("video/mp4"),
+		FileLength: proto.Uint64(1500), Seconds: proto.Uint32(12), DirectPath: proto.String("/v/video"), MediaKey: []byte{1}}}})
+	f.dispatch(&events.Message{Info: info("3EB0DOC"), Message: &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{Mimetype: proto.String("application/pdf"),
+		FileLength: proto.Uint64(2500), FileName: proto.String("عقد.pdf"), DirectPath: proto.String("/v/doc"), MediaKey: []byte{1}}}})
+	f.dispatch(&events.Message{Info: info("3EB0STK"), Message: &waE2E.Message{StickerMessage: &waE2E.StickerMessage{Mimetype: proto.String("image/webp"),
+		FileLength: proto.Uint64(uint64(len(sticker))), DirectPath: proto.String("/v/sticker"), MediaKey: []byte{1}}}})
+	f.dispatch(&events.Message{Info: info("3EB0BIG"), Message: &waE2E.Message{VideoMessage: &waE2E.VideoMessage{Mimetype: proto.String("video/mp4"),
+		FileLength: proto.Uint64(2001), DirectPath: proto.String("/v/video"), MediaKey: []byte{1}}}})
+	for range 4 {
+		h.expect(protocol.EvMessage)
+	}
+	for id, want := range map[string][]byte{"3EB0VID": video, "3EB0DOC": doc, "3EB0STK": sticker} {
+		rid := h.cmd("fetch_media", map[string]any{"chatJid": alice, "messageId": id})
+		mr := field[protocol.MediaReady](h.expect(protocol.EvMediaReady))
+		if mr.ReplyTo != rid || mr.SizeBytes != int64(len(want)) {
+			t.Fatalf("%s: %+v", id, mr)
+		}
+	}
+	h.expectError(h.cmd("fetch_media", map[string]any{"chatJid": alice, "messageId": "3EB0BIG"}), protocol.ErrMediaTooLarge)
+	// Each download is cut off at its own cap plus WhatsApp's overhead.
+	f.mu.Lock()
+	limits := append([]int64(nil), f.dlLimits...)
+	f.mu.Unlock()
+	if len(limits) != 3 {
+		t.Fatalf("downloads %v", limits)
+	}
+	seen := map[int64]bool{}
+	for _, l := range limits {
+		seen[l] = true
+	}
+	for _, want := range []int64{2000 + 26, 3000 + 26, 1000 + 26} {
+		if !seen[want] {
+			t.Fatalf("body limits %v, missing %d", limits, want)
+		}
+	}
+}
+
+func TestDownloadTypes(t *testing.T) {
+	for kind, want := range map[string]whatsmeow.MediaType{"image": whatsmeow.MediaImage, "sticker": whatsmeow.MediaImage, "voice": whatsmeow.MediaAudio,
+		"audio": whatsmeow.MediaAudio, "video": whatsmeow.MediaVideo, "document": whatsmeow.MediaDocument} {
+		if got := downloadType(kind); got != want {
+			t.Errorf("%s: %s", kind, got)
+		}
 	}
 }

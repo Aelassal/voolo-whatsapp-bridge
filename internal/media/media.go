@@ -216,23 +216,43 @@ type Limits struct {
 	VideoMaxBytes   int64
 }
 
-// Fetchable reports whether a reported kind can be fetched in v1 (voice notes
-// and images only; video, documents, stickers and other audio stay on the phone).
-func Fetchable(kind string) bool { return kind == "image" || kind == "voice" }
+// Fetchable reports whether a reported kind can be fetched: voice notes and
+// images since the first release; videos, stickers, documents and other audio
+// since revision 2 (feature fetch_all_media).
+func Fetchable(kind string) bool {
+	switch kind {
+	case "image", "voice", "video", "sticker", "document", "audio":
+		return true
+	}
+	return false
+}
+
+// MaxFetchBytes is the size cap for fetching a kind (0 for a kind that is
+// never fetched).
+func MaxFetchBytes(kind string, l Limits) int64 {
+	switch kind {
+	case "image", "sticker":
+		return l.ImageMaxBytes
+	case "voice":
+		return l.VoiceMaxBytes
+	case "video":
+		return l.VideoMaxBytes
+	case "document", "audio":
+		return l.FileMaxBytes
+	}
+	return 0
+}
 
 // CheckFetch applies the caps to a descriptor before any download.
 func CheckFetch(kind string, sizeBytes int64, durationS int, l Limits) error {
-	switch kind {
-	case "image":
-		if sizeBytes > l.ImageMaxBytes {
-			return ErrTooBig
-		}
-	case "voice":
-		if durationS > l.VoiceMaxSeconds || sizeBytes > l.VoiceMaxBytes {
-			return ErrTooBig
-		}
-	default:
+	if !Fetchable(kind) {
 		return fmt.Errorf("not fetchable")
+	}
+	if kind == "voice" && durationS > l.VoiceMaxSeconds {
+		return ErrTooBig
+	}
+	if sizeBytes < 0 || sizeBytes > MaxFetchBytes(kind, l) {
+		return ErrTooBig
 	}
 	return nil
 }

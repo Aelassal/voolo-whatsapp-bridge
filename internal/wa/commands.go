@@ -433,16 +433,10 @@ func (b *Bridge) fetchMedia(id string, c *protocol.FetchMedia) {
 	case <-s.ctx.Done():
 		return
 	}
-	mt := whatsmeow.MediaImage
-	if d.Kind == "voice" {
-		mt = whatsmeow.MediaAudio
-	}
+	mt := downloadType(d.Kind)
 	// The transport cuts the download off past the cap (plus WhatsApp's
 	// encryption overhead), whatever size the sender declared (review M2).
-	maxBytes := lim.ImageMaxBytes
-	if d.Kind == "voice" {
-		maxBytes = lim.VoiceMaxBytes
-	}
+	maxBytes := media.MaxFetchBytes(d.Kind, lim)
 	ctx, cancel := context.WithTimeout(transport.WithBodyLimit(s.ctx, maxBytes+media.DownloadOverhead), b.cfg.FetchTimeout)
 	data, err := s.cli.DownloadMediaWithPath(ctx, d.DirectPath, d.FileEncSHA256, d.FileSHA256, d.MediaKey, mt, "", false)
 	cancel()
@@ -469,6 +463,20 @@ func (b *Bridge) fetchMedia(id string, c *protocol.FetchMedia) {
 	}
 	b.emit(protocol.EvMediaReady, protocol.MediaReady{ReplyTo: id, MessageID: c.MessageID, Path: sealed.Path, Key: sealed.Key,
 		SHA256: sealed.SHA256, Mime: d.Mime, SizeBytes: sealed.SizeBytes, DurationS: durationS})
+}
+
+// downloadType is WhatsApp's media type of a reported kind: it names the keys
+// the file was encrypted with.
+func downloadType(kind string) whatsmeow.MediaType {
+	switch kind {
+	case "voice", "audio":
+		return whatsmeow.MediaAudio
+	case "video":
+		return whatsmeow.MediaVideo
+	case "document":
+		return whatsmeow.MediaDocument
+	}
+	return whatsmeow.MediaImage // image, sticker
 }
 
 // VoiceDurationMargin is how far a received voice file may read shorter than

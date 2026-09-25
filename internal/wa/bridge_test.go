@@ -691,12 +691,11 @@ func TestFetchMedia(t *testing.T) {
 	h.expect(protocol.EvMessage)
 	f.dispatch(mk("3EB0V3", 60, 32<<20+1, true))
 	h.expect(protocol.EvMessage)
-	f.dispatch(mk("3EB0A4", 60, 100, false)) // plain audio: not fetchable in v1
+	f.dispatch(mk("3EB0A4", 60, 100, false)) // plain audio: fetchable since revision 2 (a document-like file)
 	h.expect(protocol.EvMessage)
 	calls := f.dlCalls
 	h.expectError(h.cmd("fetch_media", map[string]any{"chatJid": alice, "messageId": "3EB0V2"}), protocol.ErrMediaTooLarge)
 	h.expectError(h.cmd("fetch_media", map[string]any{"chatJid": alice, "messageId": "3EB0V3"}), protocol.ErrMediaTooLarge)
-	h.expectError(h.cmd("fetch_media", map[string]any{"chatJid": alice, "messageId": "3EB0A4"}), protocol.ErrUnknownMessage)
 	h.expectError(h.cmd("fetch_media", map[string]any{"chatJid": alice, "messageId": "3EB0NOPE"}), protocol.ErrUnknownMessage)
 	if f.dlCalls != calls {
 		t.Fatal("download attempted for a refused fetch")
