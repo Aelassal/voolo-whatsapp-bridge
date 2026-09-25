@@ -5,6 +5,7 @@ package protocol
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -137,6 +138,35 @@ func TestSetPinStrict(t *testing.T) {
 	} {
 		if err := cmd(CmdSetPin, payload); (err == nil) != ok {
 			t.Errorf("%s: %v", payload, err)
+		}
+	}
+}
+
+// Revision 2, feature voice_waveform: exactly 64 bars of 0–100, voice only.
+func TestWaveform(t *testing.T) {
+	bars := func(n, v int) string {
+		parts := make([]string, n)
+		for i := range parts {
+			parts[i] = strconv.Itoa(v)
+		}
+		return "[" + strings.Join(parts, ",") + "]"
+	}
+	media := func(kind, wf string) string {
+		return `{"chatJid":"15550100002@s.whatsapp.net","outboxId":"01M3C03V80N87VFZS5G0J0NFEX","kind":"` + kind + `","path":"/tmp/m/0a.bin","key":"` +
+			strings.Repeat("1f", 32) + `","sha256":"` + strings.Repeat("aa", 32) + `","mime":"audio/ogg; codecs=opus","waveform":` + wf + `}`
+	}
+	for payload, ok := range map[string]bool{
+		media("voice", bars(64, 100)): true,
+		media("voice", bars(64, 0)):   true,
+		media("voice", bars(63, 5)):   false,
+		media("voice", bars(65, 5)):   false,
+		media("voice", bars(64, 101)): false,
+		media("voice", bars(64, -1)):  false,
+		media("file", bars(64, 5)):    false,
+		media("voice", `[1.5]`):       false,
+	} {
+		if err := cmd(CmdSendMedia, payload); (err == nil) != ok {
+			t.Errorf("%.120s…: %v", payload, err)
 		}
 	}
 }

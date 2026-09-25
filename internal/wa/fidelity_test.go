@@ -304,3 +304,22 @@ func TestSetPin(t *testing.T) {
 	f.Disconnect()
 	h.expectError(h.cmd("set_pin", map[string]any{"chatJid": alice, "pinned": true}), protocol.ErrNotConnected)
 }
+
+// Feature voice_waveform: the bars travel as WhatsApp's 64-byte waveform.
+func TestVoiceWaveform(t *testing.T) {
+	h := newHarness(t, pairedFake)
+	f := h.initPairedConnected()
+	h.knownChat(f)
+	s := sealForTest(t, h.mediaDir, oggStream(7))
+	wf := make([]int, 64)
+	for i := range wf {
+		wf[i] = i % 101
+	}
+	h.cmd("send_media", map[string]any{"chatJid": alice, "outboxId": "01M3C03V80N87VFZS5G0J0NFEX", "kind": "voice", "path": s.path,
+		"key": s.key, "sha256": s.sha, "mime": "audio/ogg; codecs=opus", "waveform": wf})
+	h.expect(protocol.EvSendResult)
+	am := f.sent[0].msg.GetAudioMessage()
+	if !am.GetPTT() || am.GetSeconds() != 7 || len(am.GetWaveform()) != 64 || am.GetWaveform()[63] != 63 {
+		t.Fatalf("voice %v", am)
+	}
+}

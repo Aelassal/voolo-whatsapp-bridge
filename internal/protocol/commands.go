@@ -146,8 +146,14 @@ type SendMedia struct {
 	DurationS int `json:"durationS,omitempty"`
 	Width     int `json:"width,omitempty"`
 	Height    int `json:"height,omitempty"`
+	// Waveform is a voice note's 64 loudness bars, 0–100 each (revision 2,
+	// feature voice_waveform); WhatsApp's apps draw it on the voice note.
+	Waveform []int `json:"waveform,omitempty"`
 	Quote
 }
+
+// WaveformBars is the length of send_media.waveform.
+const WaveformBars = 64
 
 // MarkRead is the mark_read payload.
 type MarkRead struct {
@@ -199,7 +205,7 @@ var commandSpecs = map[string]commandSpec{
 	CmdLogout:    {fields: fieldSpec{}, decode: decodeAs[Empty]},
 	CmdSendText:  {fields: withQuote(fieldSpec{"chatJid": true, "text": true, "outboxId": true}), decode: decodeAs[SendText]},
 	CmdSendMedia: {fields: withQuote(fieldSpec{"chatJid": true, "outboxId": true, "kind": true, "path": true, "key": true, "sha256": true, "mime": true,
-		"caption": false, "fileName": false, "durationS": false, "width": false, "height": false}), decode: decodeAs[SendMedia]},
+		"caption": false, "fileName": false, "durationS": false, "width": false, "height": false, "waveform": false}), decode: decodeAs[SendMedia]},
 	CmdMarkRead:   {fields: fieldSpec{"chatJid": true, "messageIds": true, "senderJid": false}, decode: decodeAs[MarkRead]},
 	CmdFetchMedia: {fields: fieldSpec{"chatJid": true, "messageId": true}, decode: decodeAs[FetchMedia]},
 	CmdAck:        {fields: fieldSpec{"seq": true}, decode: decodeAs[Ack]},
@@ -460,6 +466,16 @@ func validate(v any) error {
 		}
 		if c.Kind != "video" && (c.DurationS != 0 || c.Width != 0 || c.Height != 0) {
 			return bad("durationS, width and height are for a video")
+		}
+		if c.Waveform != nil {
+			if c.Kind != "voice" || len(c.Waveform) != WaveformBars {
+				return bad("waveform")
+			}
+			for _, v := range c.Waveform {
+				if v < 0 || v > 100 {
+					return bad("waveform")
+				}
+			}
 		}
 		if c.DurationS < 0 || c.DurationS > MaxVideoSeconds || c.Width < 0 || c.Width > MaxVideoSide || c.Height < 0 || c.Height > MaxVideoSide {
 			return bad("video facts")

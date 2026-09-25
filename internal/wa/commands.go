@@ -342,6 +342,13 @@ func (b *Bridge) sendMedia(id string, c *protocol.SendMedia) {
 		msg.AudioMessage = &waE2E.AudioMessage{Mimetype: proto.String(c.Mime), URL: proto.String(up.URL), DirectPath: proto.String(up.DirectPath),
 			MediaKey: up.MediaKey, FileEncSHA256: up.FileEncSHA256, FileSHA256: up.FileSHA256, FileLength: proto.Uint64(up.FileLength),
 			PTT: proto.Bool(true), Seconds: proto.Uint32(uint32(secs)), ContextInfo: ci}
+		if len(c.Waveform) == protocol.WaveformBars {
+			wf := make([]byte, protocol.WaveformBars)
+			for i, v := range c.Waveform {
+				wf[i] = byte(v)
+			}
+			msg.AudioMessage.Waveform = wf
+		}
 	default:
 		name := c.FileName
 		if name == "" {
