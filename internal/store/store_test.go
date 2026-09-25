@@ -269,6 +269,29 @@ func TestMediaDescriptorsAndPrune(t *testing.T) {
 	}
 }
 
+// A message reported under a @lid chat is still found after the client merged
+// that chat into its phone-number JID (chat_update aliasOf).
+func TestGetMediaFallsBackToMessageIDAfterAlias(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, t.TempDir(), key(11), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	d := MediaDesc{ChatJID: "100000000000002@lid", MessageID: "3EB0V", Kind: "voice", Mime: "audio/ogg", SizeBytes: 1, DirectPath: "/v", MediaKey: []byte{1}, MsgTS: 1}
+	_ = s.PutMedia(ctx, []MediaDesc{d})
+	if got, ok, _ := s.GetMedia(ctx, "15550100002@s.whatsapp.net", "3EB0V"); !ok || got.ChatJID != d.ChatJID {
+		t.Fatal("not found under the phone-number JID")
+	}
+	// Ambiguous ids (same id in two chats) are not guessed.
+	d2 := d
+	d2.ChatJID = "15550100009@s.whatsapp.net"
+	_ = s.PutMedia(ctx, []MediaDesc{d2})
+	if _, ok, _ := s.GetMedia(ctx, "15550100002@s.whatsapp.net", "3EB0V"); ok {
+		t.Fatal("guessed between two chats")
+	}
+}
+
 func TestWipeDeletesStoreFiles(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

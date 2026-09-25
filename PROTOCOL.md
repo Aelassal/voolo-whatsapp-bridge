@@ -260,7 +260,7 @@ Unlinks this device on WhatsApp's side, deletes it from the store and sends `log
 
 ### 6.8 `fetch_media`
 `{chatJid, messageId}`. Downloads the media of a message the bridge has reported, subject to the limits of `init`. Errors: `unknown_message`, `media_too_large` (checked before download), `media_expired` (no longer on WhatsApp's servers), `media_unavailable`, `not_connected`, `timeout`.
-- *(clarified)* v1 fetches only `voice` and `image` messages (owner decision: video, documents, stickers and other audio stay on the phone). For any other kind the bridge keeps no download descriptor, so `fetch_media` answers `unknown_message`. `chatJid` is the JID under which the message was reported. At most two downloads run at once; more wait.
+- *(clarified)* v1 fetches only `voice` and `image` messages (owner decision: video, documents, stickers and other audio stay on the phone). For any other kind the bridge keeps no download descriptor, so `fetch_media` answers `unknown_message`. `chatJid` is the JID under which the message was reported, or the phone-number JID of a chat merged through `aliasOf`. At most two downloads run at once; more wait.
 
 ### 6.9 `ack`
 `{seq}`. Acknowledges a `history_batch` (§7). No reply. *(clarified)* An `ack` acknowledges that batch **and every earlier one**; an unknown or repeated `seq` is ignored.

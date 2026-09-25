@@ -440,6 +440,9 @@ func (b *Bridge) resetAfterLogout(old *session, reason string, code int) {
 	b.emit(protocol.EvLoggedOut, protocol.LoggedOut{Reason: reason, Code: code})
 	b.setState(protocol.StateStopped)
 	b.window.Reset()
+	b.mu.Lock()
+	b.caps = &history.Caps{Days: init.Limits.HistoryDays, MaxPerChat: init.Limits.HistoryMaxPerChat, Now: b.cfg.Now}
+	b.mu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	st, err := b.cfg.OpenStore(ctx, init.StoreDir, key)

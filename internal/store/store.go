@@ -292,18 +292,42 @@ func (s *Store) PutMedia(ctx context.Context, ds []MediaDesc) error {
 	return nil
 }
 
-// GetMedia returns a descriptor, or ok=false.
+const mediaCols = `chat_jid, message_id, kind, mime, size_bytes, duration_s, direct_path, media_key, file_sha256, file_enc_sha256, msg_ts`
+
+func scanMedia(sc interface{ Scan(...any) error }) (d MediaDesc, err error) {
+	err = sc.Scan(&d.ChatJID, &d.MessageID, &d.Kind, &d.Mime, &d.SizeBytes, &d.DurationS, &d.DirectPath, &d.MediaKey, &d.FileSHA256, &d.FileEncSHA256, &d.MsgTS)
+	return d, err
+}
+
+// GetMedia returns a descriptor, or ok=false. When nothing is stored under
+// chatJID (the message was reported under a @lid chat that the client has
+// since merged into its phone-number JID), a message id that is stored in
+// exactly one chat is found anyway; an ambiguous id is not guessed.
 func (s *Store) GetMedia(ctx context.Context, chatJID, messageID string) (d MediaDesc, ok bool, err error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT chat_jid, message_id, kind, mime, size_bytes, duration_s, direct_path, media_key, file_sha256, file_enc_sha256, msg_ts
-		FROM voolo_media WHERE chat_jid=$1 AND message_id=$2`, chatJID, messageID)
-	err = row.Scan(&d.ChatJID, &d.MessageID, &d.Kind, &d.Mime, &d.SizeBytes, &d.DurationS, &d.DirectPath, &d.MediaKey, &d.FileSHA256, &d.FileEncSHA256, &d.MsgTS)
-	if errors.Is(err, sql.ErrNoRows) {
-		return d, false, nil
+	d, err = scanMedia(s.DB.QueryRowContext(ctx, `SELECT `+mediaCols+` FROM voolo_media WHERE chat_jid=$1 AND message_id=$2`, chatJID, messageID))
+	if err == nil {
+		return d, true, nil
 	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return d, false, &IOError{err}
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT `+mediaCols+` FROM voolo_media WHERE message_id=$1 LIMIT 2`, messageID)
 	if err != nil {
 		return d, false, &IOError{err}
 	}
-	return d, true, nil
+	defer rows.Close()
+	var found []MediaDesc
+	for rows.Next() {
+		m, err := scanMedia(rows)
+		if err != nil {
+			return d, false, &IOError{err}
+		}
+		found = append(found, m)
+	}
+	if len(found) != 1 {
+		return MediaDesc{}, false, rows.Err()
+	}
+	return found[0], true, nil
 }
 
 // PruneMedia deletes descriptors of messages older than the retention.

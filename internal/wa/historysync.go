@@ -200,10 +200,17 @@ func (b *Bridge) historyConversation(s *session, syncType string, conv *waHistor
 			if !protocol.IsUserJID(sender) {
 				continue
 			}
-			reactions[m.ID] = append(reactions[m.ID], protocol.Reaction{ChatJID: chat, MessageID: m.ID, SenderJID: sender, Emoji: truncate(r.GetText(), 32), At: r.GetSenderTimestampMS()})
+			at := r.GetSenderTimestampMS()
+			if at <= 0 {
+				at = m.TS
+			}
+			reactions[m.ID] = append(reactions[m.ID], protocol.Reaction{ChatJID: chat, MessageID: m.ID, SenderJID: sender, Emoji: truncate(r.GetText(), 32), At: at})
 		}
 	}
-	kept, dropped := b.caps.Filter(chat, msgs)
+	b.mu.Lock()
+	caps := b.caps
+	b.mu.Unlock()
+	kept, dropped := caps.Filter(chat, msgs)
 	if dropped > 0 {
 		b.cfg.Log.Info("history_capped", logx.N(int64(dropped)))
 	}

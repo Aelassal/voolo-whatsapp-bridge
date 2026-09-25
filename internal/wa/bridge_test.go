@@ -816,6 +816,48 @@ func TestHistoryPerChatCap(t *testing.T) {
 	}
 }
 
+func TestHistoryReactionsAndCapsResetAfterLogout(t *testing.T) {
+	h := newHarness(t, pairedFake)
+	h.init(map[string]any{"historyDays": 90, "historyMaxPerChat": 2, "imageMaxBytes": 1 << 20, "voiceMaxSeconds": 300})
+	f := h.fake()
+	f.dispatch(&events.Connected{})
+	push := func(f *fakeClient, ids ...string) {
+		conv := &waHistorySync.Conversation{ID: proto.String(alice)}
+		for i, id := range ids {
+			hm := histMsg(alice, id, h.now.Add(-time.Duration(i)*time.Minute), "x")
+			hm.Message.Reactions = []*waWeb.Reaction{{Key: &msgKey{FromMe: proto.Bool(true)}, Text: proto.String("❤")}}
+			conv.Messages = append(conv.Messages, hm)
+		}
+		n := &waE2E.HistorySyncNotification{}
+		f.mu.Lock()
+		f.history[n] = &waHistorySync.HistorySync{SyncType: waHistorySync.HistorySync_RECENT.Enum(), Conversations: []*waHistorySync.Conversation{conv}}
+		f.mu.Unlock()
+		f.dispatch(&events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: mustParse(me), Sender: mustParse(me), IsFromMe: true}, ID: "3EB0N"},
+			Message: &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{HistorySyncNotification: n}}})
+	}
+	push(f, "3EB0R1", "3EB0R2", "3EB0R3")
+	b := field[protocol.HistoryBatch](h.expect(protocol.EvHistoryBatch))
+	if len(b.Messages) != 2 {
+		t.Fatalf("cap 2: %d", len(b.Messages))
+	}
+	r := field[protocol.Reaction](h.expect(protocol.EvReaction))
+	if r.SenderJID != me || r.At == 0 || r.Emoji != "❤" {
+		t.Fatalf("history reaction %+v", r)
+	}
+	h.cmd("ack", map[string]any{"seq": b.Seq})
+	f.dispatch(&events.LoggedOut{Reason: events.ConnectFailureLoggedOut})
+	h.expectState(protocol.StateUnpaired)
+	// A new account on the same bridge process starts with fresh per-chat counts.
+	f2 := h.fake()
+	f2.mu.Lock()
+	f2.account = AccountInfo{JID: mustParse(me)}
+	f2.mu.Unlock()
+	push(f2, "3EB0S1", "3EB0S2")
+	if b := field[protocol.HistoryBatch](h.expect(protocol.EvHistoryBatch)); len(b.Messages) != 2 {
+		t.Fatalf("after logout: %d messages", len(b.Messages))
+	}
+}
+
 // ------------------------------------------------------------ guarantees
 
 // No presence is ever sent: the client interface the bridge uses has no
