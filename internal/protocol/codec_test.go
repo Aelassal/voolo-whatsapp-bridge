@@ -72,7 +72,8 @@ var eventTypes = map[string]func() any{
 	EvReaction: func() any { return &Reaction{} }, EvReceipt: func() any { return &Receipt{} },
 	EvHistoryBatch: func() any { return &HistoryBatch{} }, EvMediaReady: func() any { return &MediaReady{} },
 	EvSendResult: func() any { return &SendResult{} }, EvOK: func() any { return &Reply{} },
-	EvPong: func() any { return &Reply{} }, EvError: func() any { return &ErrorEvent{} },
+	EvAvatar: func() any { return &Avatar{} },
+	EvPong:   func() any { return &Reply{} }, EvError: func() any { return &ErrorEvent{} },
 }
 
 func TestEveryEventExampleRoundTrips(t *testing.T) {

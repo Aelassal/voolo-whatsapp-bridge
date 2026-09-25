@@ -10,6 +10,9 @@ package wa
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -23,6 +26,8 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/Aelassal/voolo-whatsapp-bridge/internal/transport"
 )
 
 // AccountInfo is what the store knows about the linked account.
@@ -54,6 +59,11 @@ type Client interface {
 	GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error)
 	// SendAppState writes one app-state patch (set_pin, revision 2).
 	SendAppState(ctx context.Context, patch appstate.PatchInfo) error
+	// GetProfilePictureInfo and FetchPicture serve fetch_avatar (revision 2).
+	GetProfilePictureInfo(ctx context.Context, jid types.JID, params *whatsmeow.GetProfilePictureParams) (*types.ProfilePictureInfo, error)
+	// FetchPicture downloads a profile picture URL through the guarded media
+	// client, at most max bytes.
+	FetchPicture(ctx context.Context, url string, max int64) ([]byte, error)
 
 	Account() AccountInfo
 	PNForLID(ctx context.Context, lid types.JID) types.JID
@@ -62,6 +72,28 @@ type Client interface {
 
 type realClient struct {
 	*whatsmeow.Client
+	media *http.Client // the guarded media client (allowlist + body limit)
+}
+
+// FetchPicture downloads a profile picture over the guarded media client: the
+// host allowlist of §10.2 and a body limit of max bytes apply.
+func (c realClient) FetchPicture(ctx context.Context, url string, max int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(transport.WithBodyLimit(ctx, max), http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if req.URL.Scheme != "https" {
+		return nil, errors.New("picture url is not https")
+	}
+	resp, err := c.media.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("picture download: status %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
 }
 
 func (c realClient) Account() AccountInfo {
@@ -107,7 +139,7 @@ func NewRealClient(device *store.Device, httpClient, mediaClient *http.Client, l
 	cli.EnableAutoReconnect = true
 	cli.InitialAutoReconnect = true
 	cli.EmitAppStateEventsOnFullSync = false
-	return realClient{cli}
+	return realClient{cli, mediaClient}
 }
 
 // ConfigureDevice sets the linked-device properties before pairing: the name

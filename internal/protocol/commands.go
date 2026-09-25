@@ -26,10 +26,12 @@ const (
 	CmdMarkRead   = "mark_read"
 	CmdFetchMedia = "fetch_media"
 	// Revision 2 (PROTOCOL.md §6.12): pin or unpin one chat, on the user's action.
-	CmdSetPin   = "set_pin"
-	CmdAck      = "ack"
-	CmdPing     = "ping"
-	CmdShutdown = "shutdown"
+	CmdSetPin = "set_pin"
+	// Revision 2 (PROTOCOL.md §6.13): one chat's profile picture, preview size.
+	CmdFetchAvatar = "fetch_avatar"
+	CmdAck         = "ack"
+	CmdPing        = "ping"
+	CmdShutdown    = "shutdown"
 )
 
 // Ceilings the bridge enforces whatever the client asks for (§6.1, ADR-012 S5
@@ -174,6 +176,15 @@ type SetPin struct {
 	Pinned  bool   `json:"pinned"`
 }
 
+// FetchAvatar is the fetch_avatar payload (revision 2, feature avatar).
+type FetchAvatar struct {
+	JID     string `json:"jid"`
+	KnownID string `json:"knownId,omitempty"`
+}
+
+// MaxAvatarBytes caps a profile picture download (a preview is a few KB).
+const MaxAvatarBytes = 256 << 10
+
 // Ack is the ack payload.
 type Ack struct {
 	Seq int64 `json:"seq"`
@@ -206,12 +217,13 @@ var commandSpecs = map[string]commandSpec{
 	CmdSendText:  {fields: withQuote(fieldSpec{"chatJid": true, "text": true, "outboxId": true}), decode: decodeAs[SendText]},
 	CmdSendMedia: {fields: withQuote(fieldSpec{"chatJid": true, "outboxId": true, "kind": true, "path": true, "key": true, "sha256": true, "mime": true,
 		"caption": false, "fileName": false, "durationS": false, "width": false, "height": false, "waveform": false}), decode: decodeAs[SendMedia]},
-	CmdMarkRead:   {fields: fieldSpec{"chatJid": true, "messageIds": true, "senderJid": false}, decode: decodeAs[MarkRead]},
-	CmdFetchMedia: {fields: fieldSpec{"chatJid": true, "messageId": true}, decode: decodeAs[FetchMedia]},
-	CmdAck:        {fields: fieldSpec{"seq": true}, decode: decodeAs[Ack]},
-	CmdSetPin:     {fields: fieldSpec{"chatJid": true, "pinned": true}, decode: decodeAs[SetPin]},
-	CmdPing:       {fields: fieldSpec{}, decode: decodeAs[Empty]},
-	CmdShutdown:   {fields: fieldSpec{}, decode: decodeAs[Empty]},
+	CmdMarkRead:    {fields: fieldSpec{"chatJid": true, "messageIds": true, "senderJid": false}, decode: decodeAs[MarkRead]},
+	CmdFetchMedia:  {fields: fieldSpec{"chatJid": true, "messageId": true}, decode: decodeAs[FetchMedia]},
+	CmdAck:         {fields: fieldSpec{"seq": true}, decode: decodeAs[Ack]},
+	CmdSetPin:      {fields: fieldSpec{"chatJid": true, "pinned": true}, decode: decodeAs[SetPin]},
+	CmdFetchAvatar: {fields: fieldSpec{"jid": true, "knownId": false}, decode: decodeAs[FetchAvatar]},
+	CmdPing:        {fields: fieldSpec{}, decode: decodeAs[Empty]},
+	CmdShutdown:    {fields: fieldSpec{}, decode: decodeAs[Empty]},
 }
 
 // withQuote adds the optional reply and forward fields of revision 2 to a
@@ -362,6 +374,7 @@ var (
 	chatJIDRe  = regexp.MustCompile(`^(?:[0-9]{1,20}@s\.whatsapp\.net|[0-9]{1,20}@lid|[0-9]{1,20}(?:-[0-9]{1,20})?@g\.us)$`)
 	userJIDRe  = regexp.MustCompile(`^(?:[0-9]{1,20}@s\.whatsapp\.net|[0-9]{1,20}@lid)$`)
 	msgIDRe    = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
+	pictureRe  = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
 	mimeRe     = regexp.MustCompile(`^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}(?:; ?[a-z0-9_-]{1,32}=[A-Za-z0-9_.-]{1,64})*$`)
 )
 
@@ -373,6 +386,9 @@ func IsUserJID(s string) bool { return len(s) <= MaxJIDLen && userJIDRe.MatchStr
 
 // IsMessageID reports whether s is a message id (§3).
 func IsMessageID(s string) bool { return msgIDRe.MatchString(s) }
+
+// IsPictureID reports whether s is a profile picture id (§6.13).
+func IsPictureID(s string) bool { return pictureRe.MatchString(s) }
 
 // IsGroupJID reports whether s is a group chat JID.
 func IsGroupJID(s string) bool { return strings.HasSuffix(s, "@g.us") }
@@ -519,6 +535,10 @@ func validate(v any) error {
 	case *SetPin:
 		if !IsChatJID(c.ChatJID) {
 			return bad("set_pin")
+		}
+	case *FetchAvatar:
+		if !IsChatJID(c.JID) || (c.KnownID != "" && !IsPictureID(c.KnownID)) {
+			return bad("fetch_avatar")
 		}
 	case *Ack:
 		if c.Seq < 1 {

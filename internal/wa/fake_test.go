@@ -70,6 +70,11 @@ type fakeClient struct {
 	patches  []appstate.PatchInfo
 	patchErr error
 
+	pictures   map[string]*types.ProfilePictureInfo // jid → info (nil value: unchanged)
+	pictureErr map[string]error
+	pictureAt  []time.Time       // when each GetProfilePictureInfo ran (real clock)
+	picBytes   map[string][]byte // url → bytes
+
 	pairPhones []string
 	pairNames  []string
 	logoutErr  error
@@ -89,6 +94,7 @@ type markCall struct {
 
 func newFake() *fakeClient {
 	return &fakeClient{downloads: map[string][]byte{}, pnForLID: map[string]types.JID{}, contacts: map[string]types.ContactInfo{},
+		pictures: map[string]*types.ProfilePictureInfo{}, pictureErr: map[string]error{}, picBytes: map[string][]byte{},
 		history: map[*waE2E.HistorySyncNotification]*waHistorySync.HistorySync{}}
 }
 
@@ -277,6 +283,26 @@ func (f *fakeClient) SendAppState(_ context.Context, p appstate.PatchInfo) error
 	}
 	f.patches = append(f.patches, p)
 	return nil
+}
+
+func (f *fakeClient) GetProfilePictureInfo(_ context.Context, j types.JID, _ *whatsmeow.GetProfilePictureParams) (*types.ProfilePictureInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pictureAt = append(f.pictureAt, time.Now())
+	if err := f.pictureErr[j.String()]; err != nil {
+		return nil, err
+	}
+	return f.pictures[j.String()], nil
+}
+
+func (f *fakeClient) FetchPicture(ctx context.Context, url string, max int64) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b := f.picBytes[url]
+	if int64(len(b)) > max {
+		return nil, transport.ErrBodyTooLarge
+	}
+	return append([]byte(nil), b...), nil
 }
 
 func (f *fakeClient) Account() AccountInfo { f.mu.Lock(); defer f.mu.Unlock(); return f.account }

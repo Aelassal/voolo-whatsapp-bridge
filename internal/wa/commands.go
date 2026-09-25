@@ -12,6 +12,7 @@ import (
 	_ "image/jpeg" // image sizes for send_media
 	_ "image/png"
 	"mime"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -558,6 +559,85 @@ func (b *Bridge) setPin(id string, c *protocol.SetPin) {
 	}
 	b.emit(protocol.EvOK, protocol.Reply{ReplyTo: id})
 	b.cfg.Log.Info("pin_ok")
+}
+
+// AvatarInterval is the least time between two profile picture queries
+// (PROTOCOL.md §6.13): the bridge waits, it does not refuse.
+const AvatarInterval = time.Second
+
+// fetchAvatar answers fetch_avatar (revision 2, feature avatar): the preview
+// of one reported chat's profile picture, as a §8 hand-off file, or its state
+// (unchanged, none, hidden). One at a time, at most one query a second.
+func (b *Bridge) fetchAvatar(id string, c *protocol.FetchAvatar) {
+	s, ok := b.ready(id)
+	if !ok {
+		return
+	}
+	jid, err := types.ParseJID(c.JID)
+	if err != nil || !b.knownChat(c.JID) {
+		b.fail(id, protocol.ErrUnknownChat)
+		return
+	}
+	b.picMu.Lock()
+	defer b.picMu.Unlock()
+	b.mu.Lock()
+	wait := AvatarInterval - b.cfg.Now().Sub(b.lastPic)
+	dir := b.init.MediaDir
+	b.mu.Unlock()
+	if wait > 0 && wait <= AvatarInterval {
+		select {
+		case <-time.After(wait):
+		case <-s.ctx.Done():
+			return
+		}
+	}
+	b.mu.Lock()
+	b.lastPic = b.cfg.Now()
+	b.mu.Unlock()
+	answer := protocol.Avatar{ReplyTo: id, JID: c.JID}
+	ctx, cancel := context.WithTimeout(s.ctx, 20*time.Second)
+	defer cancel()
+	info, err := s.cli.GetProfilePictureInfo(ctx, jid, &whatsmeow.GetProfilePictureParams{Preview: true, ExistingID: c.KnownID})
+	switch {
+	case errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized):
+		answer.State = protocol.AvatarHidden
+	case errors.Is(err, whatsmeow.ErrProfilePictureNotSet):
+		answer.State = protocol.AvatarNone
+	case err != nil:
+		code := SendErrorCode(err)
+		if code != protocol.ErrRateLimited && code != protocol.ErrTimeout && code != protocol.ErrNotConnected {
+			code = protocol.ErrMediaUnavailable
+		}
+		b.fail(id, code)
+		b.cfg.Log.Warn("avatar_failed", logx.Code(code))
+		return
+	case info == nil:
+		answer.State = protocol.AvatarUnchanged
+		answer.ID = c.KnownID
+	default:
+		data, err := s.cli.FetchPicture(ctx, info.URL, protocol.MaxAvatarBytes)
+		mime := http.DetectContentType(data)
+		if err != nil || (mime != "image/jpeg" && mime != "image/png" && mime != "image/webp") || !protocol.IsPictureID(info.ID) {
+			code := protocol.ErrMediaUnavailable
+			if errors.Is(err, transport.ErrBodyTooLarge) {
+				code = protocol.ErrMediaTooLarge
+			}
+			clear(data)
+			b.fail(id, code)
+			b.cfg.Log.Warn("avatar_failed", logx.Code(code))
+			return
+		}
+		sealed, err := media.Seal(dir, data)
+		clear(data)
+		if err != nil {
+			b.fail(id, protocol.ErrInternal)
+			return
+		}
+		answer.State, answer.ID, answer.Path, answer.Key, answer.SHA256, answer.Mime, answer.SizeBytes =
+			protocol.AvatarSet, info.ID, sealed.Path, sealed.Key, sealed.SHA256, mime, sealed.SizeBytes
+	}
+	b.emit(protocol.EvAvatar, answer)
+	b.cfg.Log.Info("avatar_ok", logx.Code(answer.State))
 }
 
 func (b *Bridge) logout(id string) {

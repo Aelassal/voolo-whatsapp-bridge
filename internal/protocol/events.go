@@ -26,6 +26,7 @@ const (
 	EvHistoryBatch = "history_batch"
 	EvMediaReady   = "media_ready"
 	EvSendResult   = "send_result"
+	EvAvatar       = "avatar" // revision 2, reply to fetch_avatar
 	EvOK           = "ok"
 	EvPong         = "pong"
 	EvError        = "error"
@@ -51,11 +52,12 @@ const (
 	FeatureFetchAll     = "fetch_all_media"
 	FeatureSetPin       = "set_pin"
 	FeatureWaveform     = "voice_waveform"
+	FeatureAvatar       = "avatar"
 )
 
 // Features returns the features this bridge offers.
 func Features() []string {
-	return []string{FeatureReplyContext, FeatureForward, FeatureSendVideo, FeatureFetchAll, FeatureSetPin, FeatureWaveform}
+	return []string{FeatureReplyContext, FeatureForward, FeatureSendVideo, FeatureFetchAll, FeatureSetPin, FeatureWaveform, FeatureAvatar}
 }
 
 // Account is ready.account.
@@ -337,6 +339,28 @@ type MediaReady struct {
 	Mime      string `json:"mime"`
 	SizeBytes int64  `json:"sizeBytes"`
 	DurationS int    `json:"durationS,omitempty"`
+}
+
+// Avatar states (§5.23).
+const (
+	AvatarSet       = "set"
+	AvatarUnchanged = "unchanged"
+	AvatarNone      = "none"
+	AvatarHidden    = "hidden"
+)
+
+// Avatar is §5.23 (revision 2): the answer to fetch_avatar. A "set" answer
+// carries a §8 hand-off file of the picture.
+type Avatar struct {
+	ReplyTo   string `json:"replyTo"`
+	JID       string `json:"jid"`
+	State     string `json:"state"`
+	ID        string `json:"id,omitempty"`
+	Path      string `json:"path,omitempty"`
+	Key       string `json:"key,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	Mime      string `json:"mime,omitempty"`
+	SizeBytes int64  `json:"sizeBytes,omitempty"`
 }
 
 // SendResult is §5.21.

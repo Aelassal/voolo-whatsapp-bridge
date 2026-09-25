@@ -24,5 +24,6 @@ func init() {
 		protocol.EvPairFailed, protocol.EvLoggedOut, protocol.EvSyncProgress, protocol.EvChat, protocol.EvChatUpdate, protocol.EvContact,
 		protocol.EvGroup, protocol.EvMessage, protocol.EvMsgUpdate, protocol.EvReaction, protocol.EvReceipt, protocol.EvHistoryBatch,
 		protocol.EvMediaReady, protocol.EvSendResult, protocol.EvOK, protocol.EvPong, protocol.EvError,
+		protocol.EvAvatar, protocol.AvatarSet, protocol.AvatarUnchanged, protocol.AvatarNone, protocol.AvatarHidden,
 	)
 }

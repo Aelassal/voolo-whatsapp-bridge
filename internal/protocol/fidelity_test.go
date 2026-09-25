@@ -170,3 +170,20 @@ func TestWaveform(t *testing.T) {
 		}
 	}
 }
+
+func TestFetchAvatarStrict(t *testing.T) {
+	for payload, ok := range map[string]bool{
+		`{"jid":"15550100002@s.whatsapp.net"}`:                     true,
+		`{"jid":"120363000000000001@g.us","knownId":"1790330400"}`: true,
+		`{"jid":"100000000000002@lid"}`:                            true,
+		`{"jid":"status@broadcast"}`:                               false,
+		`{"jid":"15550100002@s.whatsapp.net","knownId":"a b"}`:     false,
+		`{"jid":"15550100002@s.whatsapp.net","knownId":""}`:        true,
+		`{"jid":"15550100002@s.whatsapp.net","full":true}`:         false,
+		`{"jids":["15550100002@s.whatsapp.net"]}`:                  false,
+	} {
+		if err := cmd(CmdFetchAvatar, payload); (err == nil) != ok {
+			t.Errorf("%s: %v", payload, err)
+		}
+	}
+}

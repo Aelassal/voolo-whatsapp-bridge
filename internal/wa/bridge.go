@@ -119,8 +119,10 @@ type Bridge struct {
 	loggedOut *logoutInfo // set once the account is unlinked; Stop wipes the store
 	sends     []time.Time // reservation times of recent sends, oldest first (send backstop)
 	pins      []time.Time // times of recent set_pin writes (their own backstop, rev 2)
+	lastPic   time.Time   // when the last fetch_avatar asked WhatsApp (≤ 1 per second, rev 2)
 
 	sending  atomic.Bool
+	picMu    sync.Mutex // one fetch_avatar at a time
 	fetchSem chan struct{}
 	window   *history.Window
 	caps     *history.Caps
@@ -275,6 +277,8 @@ func (b *Bridge) Handle(env protocol.Envelope) (shutdown bool) {
 		b.asyncCmd(id, func() { b.fetchMedia(id, c) })
 	case *protocol.SetPin:
 		b.asyncCmd(id, func() { b.setPin(id, c) })
+	case *protocol.FetchAvatar:
+		b.asyncCmd(id, func() { b.fetchAvatar(id, c) })
 	case *protocol.Empty:
 		switch env.Type {
 		case protocol.CmdPing:

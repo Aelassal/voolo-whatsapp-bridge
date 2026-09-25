@@ -89,7 +89,7 @@ Examples of every event are in `examples/bridge-to-app/`. Optional fields are ma
 ### 5.1 `hello`
 First line the bridge writes.
 `{bridge: "voolo-whatsapp-bridge", version: "<semver>", protocol: 1, os: "windows|darwin|linux", arch: "amd64|arm64", features?: [string]}`
-*(rev 2)* `features?: string[]`: what this bridge offers beyond the first release of v1. A client MUST NOT send a command or a field that belongs to a feature the bridge did not list; an older bridge lists none (and answers a new command with `unknown_command`). Names so far: `reply_context` (§6.5, §6.6 quote fields), `forward` (§6.5, §6.6 `forwarded`), `send_video` (§6.1 `videoMaxBytes`/`fileMaxBytes`, §6.6 `kind: video`), `fetch_all_media` (§6.8 videos, stickers, documents, audio), `set_pin` (§6.12), `voice_waveform` (§6.6 `waveform`).
+*(rev 2)* `features?: string[]`: what this bridge offers beyond the first release of v1. A client MUST NOT send a command or a field that belongs to a feature the bridge did not list; an older bridge lists none (and answers a new command with `unknown_command`). Names so far: `reply_context` (§6.5, §6.6 quote fields), `forward` (§6.5, §6.6 `forwarded`), `send_video` (§6.1 `videoMaxBytes`/`fileMaxBytes`, §6.6 `kind: video`), `fetch_all_media` (§6.8 videos, stickers, documents, audio), `set_pin` (§6.12), `voice_waveform` (§6.6 `waveform`), `avatar` (§5.23, §6.13).
 *(review)* `version` is `MAJOR.MINOR.PATCH` without a leading `v` (a development build says `0.0.0-dev`). Versions are compared as three numbers, never with a `v` and never as strings, for example against `flags.json` `maxBridgeVersion` (§11) and release tags (§13).
 
 ### 5.2 `ready` (reply to `init`)
@@ -204,6 +204,12 @@ See §8. `{replyTo, messageId, path, key, sha256, mime, sizeBytes, durationS?}`.
 - `error {replyTo?, code, retryable, fatal?}`: see §9. `fatal: true` means the bridge exits right after this line.
 - *(re-review, lead decision)* Every `fatal: true` error is followed by the process's exit, with the code listed for it: `store_key_invalid` → **3**, `store_locked` → **4**, `client_outdated` → **5** (§9). No other code is ever fatal. (A logout is not announced with a fatal error: it ends with `logged_out` and exit 7, §5.9.)
 
+### 5.23 `avatar` (reply to `fetch_avatar`) *(rev 2, feature `avatar`)*
+`{replyTo, jid, state, id?, path?, key?, sha256?, mime?, sizeBytes?}` where `state` is:
+- `set`: the preview picture, as a §8 hand-off file (`path`, `key`, `sha256`, `sizeBytes` ≤ 262,144) with `mime` `image/jpeg`, `image/png` or `image/webp` (read from the bytes), and the picture's `id` (1–64 characters of `[A-Za-z0-9._:-]`).
+- `unchanged`: the picture is still the one `knownId` named (`id` repeats it); no file.
+- `none`: the chat has no picture. `hidden`: its privacy settings hide it from this account. No file.
+
 ## 6. Commands (client → bridge)
 
 Examples of every command are in `examples/app-to-bridge/`. Commands are decoded strictly (§2). Timeouts are what a client SHOULD wait for the final reply before treating the command as failed.
@@ -219,6 +225,7 @@ Examples of every command are in `examples/app-to-bridge/`. Commands are decoded
 | `mark_read` | §6.7 | `ok` | 30 s |
 | `fetch_media` | `{chatJid, messageId}` | `media_ready` | 120 s |
 | `set_pin` *(rev 2)* | `{chatJid, pinned}` | `ok` | 30 s |
+| `fetch_avatar` *(rev 2)* | `{jid, knownId?}` | `avatar` | 60 s |
 | `ack` | `{seq}` | none | — |
 | `ping` | `{}` | `pong` | 30 s |
 | `shutdown` | `{}` | `ok`, then exit 0 | 3 s |
@@ -303,6 +310,9 @@ The bridge disconnects, flushes and closes the store, replies `ok` and exits wit
 
 ### 6.12 `set_pin` *(rev 2, feature `set_pin`)*
 `{chatJid, pinned: bool}`. Pins (`true`) or unpins (`false`) one chat in WhatsApp's app state, so the phone and every other linked device show the change; the change comes back as `chat_update {pinned}` like one made on the phone. It sends no message and no presence. Checks, in order: `not_paired`, `not_connected`, `unknown_chat` (as for sends, §6.5), then its own compiled-in backstop — at least **1 s** between two `set_pin`s and at most **20 in any 10 minutes** — else `error {rate_limited_local, retryable: true}` and nothing is written. Other errors: `timeout`, `internal`. Never repeated by the bridge. WhatsApp's apps keep at most three pinned chats; the bridge does not count them (a client SHOULD refuse a fourth pin itself).
+
+### 6.13 `fetch_avatar` *(rev 2, feature `avatar`)*
+`{jid, knownId?}`. Asks WhatsApp for the **preview** of one reported chat's profile picture (a person's or a group's; `unknown_chat` otherwise), as WhatsApp Web does for the chats it shows. `knownId` is the `id` of the picture the client already holds: when it is still current the answer is `avatar {unchanged}` and nothing is downloaded. The bridge serves one `fetch_avatar` at a time and asks WhatsApp **at most once a second** (a faster client waits; nothing is refused for it). The picture is downloaded from WhatsApp's picture host (`pps.whatsapp.net`, inside the §10.2 allowlist) over the same guarded client as media, cut off at 262,144 bytes (`media_too_large`); anything that is not a JPEG, PNG or WebP is `media_unavailable`. Errors: `not_paired`, `not_connected`, `unknown_chat`, `rate_limited` (WhatsApp said so; the client SHOULD stop asking for a while), `timeout`, `media_too_large`, `media_unavailable`, `internal`. A client SHOULD ask only for chats its user can see, and cache the answer (Voolo: 24 hours).
 
 ## 7. History and flow control
 
@@ -394,7 +404,7 @@ Any other code, or death by a signal, is a crash.
 
 ### 10.3 Behaviour
 - No presence is ever sent: the linked device never appears "online".
-- Media is downloaded only on `fetch_media`.
+- Media is downloaded only on `fetch_media`. *(rev 2)* A profile picture only on `fetch_avatar`.
 - No status updates, broadcast lists or newsletters are read or reported. *(review, corrected)* The address book is never **reported**: WhatsApp's own app-state sync gives every linked device the phone's contact names, and whatsmeow keeps them in the encrypted store (they are used only for the names of reported chats and senders, §5.13). No command reads it out.
 - One send at a time, never retried by the bridge, never repeated for the same `outboxId`, and no faster than the backstop (§6.5; for resends inside the connection library, see there).
 
@@ -413,7 +423,7 @@ Events, by area:
 | process and stdio | `started`, `stdin_eof`, `shutdown`, `init_timeout`, `line_dropped` (`code` `too_long` or `invalid`, `n` the count), `emit_failed`, `emit_dropped` (*(re-review)* a line dropped because the bridge is stopping, §6.11; `code` its event type, `n` the count), `panic`, `panic_recovered`, `stop_timeout`, `exit_logged_out` |
 | init and store | `ready`, `fatal`, `store_open_failed`, `store_close_failed`, `store_wiped`, `store_wipe_failed`, `store_write_failed`, `media_prune_failed`, `media_stale_deleted` |
 | connection and pairing | `status`, `signal`, `connect_failed`, `host_blocked`, `logged_out`, `pairing_started`, `pairing_failed`, `pairing_timeout`, `paired`, `version_refreshed`, `version_refresh_failed` |
-| commands | `command_refused`, `send_ok`, `send_failed`, `send_refused`, `send_clock_skew` (*(re-review)* send times after the clock were moved back, §6.5; `n` how many), `fetch_failed`, `group_info_failed`, `joined_groups_failed`; *(rev 2)* `pin_ok`, `pin_failed` |
+| commands | `command_refused`, `send_ok`, `send_failed`, `send_refused`, `send_clock_skew` (*(re-review)* send times after the clock were moved back, §6.5; `n` how many), `fetch_failed`, `group_info_failed`, `joined_groups_failed`; *(rev 2)* `pin_ok`, `pin_failed`, `avatar_ok`, `avatar_failed` |
 | history | `history_capped`, `history_done`, `history_download_failed` |
 | library | `whatsmeow` |
 

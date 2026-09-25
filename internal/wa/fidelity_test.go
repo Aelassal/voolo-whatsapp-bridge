@@ -5,9 +5,14 @@ package wa
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/hex"
 	"errors"
 	"image"
 	"image/jpeg"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -321,5 +326,81 @@ func TestVoiceWaveform(t *testing.T) {
 	am := f.sent[0].msg.GetAudioMessage()
 	if !am.GetPTT() || am.GetSeconds() != 7 || len(am.GetWaveform()) != 64 || am.GetWaveform()[63] != 63 {
 		t.Fatalf("voice %v", am)
+	}
+}
+
+// Feature avatar: the picture as a hand-off file, or its state; one query a
+// second; a reported chat only; the size cap and the image types.
+func TestFetchAvatar(t *testing.T) {
+	h := newHarness(t, pairedFake)
+	f := h.initPairedConnected()
+	h.expectError(h.cmd("fetch_avatar", map[string]any{"jid": alice}), protocol.ErrUnknownChat)
+	h.knownChat(f)
+	f.dispatch(textMsg(mustParse(group), mustParse(bob), "3EB0G", "hi", false))
+	h.expect(protocol.EvMessage)
+	pic := jpegForTest(t)
+	f.mu.Lock()
+	f.pictures[alice] = &types.ProfilePictureInfo{ID: "1790330400", URL: "https://pps.whatsapp.net/v/alice", Type: "preview"}
+	f.picBytes["https://pps.whatsapp.net/v/alice"] = pic
+	f.pictureErr[group] = whatsmeow.ErrProfilePictureNotSet
+	f.mu.Unlock()
+
+	id := h.cmd("fetch_avatar", map[string]any{"jid": alice})
+	a := field[protocol.Avatar](h.expect(protocol.EvAvatar))
+	if a.ReplyTo != id || a.State != "set" || a.ID != "1790330400" || a.Mime != "image/jpeg" || a.SizeBytes != int64(len(pic)) ||
+		filepath.Dir(a.Path) != h.mediaDir {
+		t.Fatalf("avatar %+v", a)
+	}
+	raw, _ := os.ReadFile(a.Path)
+	k, _ := hex.DecodeString(a.Key)
+	block, _ := aes.NewCipher(k)
+	gcm, _ := cipher.NewGCM(block)
+	if got, err := gcm.Open(nil, raw[:12], raw[12:], nil); err != nil || !bytes.Equal(got, pic) {
+		t.Fatal("hand-off file")
+	}
+	// Unchanged since the known id: no file.
+	f.mu.Lock()
+	f.pictures[alice] = nil
+	f.mu.Unlock()
+	h.cmd("fetch_avatar", map[string]any{"jid": alice, "knownId": "1790330400"})
+	if a := field[protocol.Avatar](h.expect(protocol.EvAvatar)); a.State != "unchanged" || a.Path != "" || a.ID != "1790330400" {
+		t.Fatalf("unchanged %+v", a)
+	}
+	h.cmd("fetch_avatar", map[string]any{"jid": group})
+	if a := field[protocol.Avatar](h.expect(protocol.EvAvatar)); a.State != "none" || a.Path != "" {
+		t.Fatalf("none %+v", a)
+	}
+	f.mu.Lock()
+	f.pictureErr[alice] = whatsmeow.ErrProfilePictureUnauthorized
+	f.mu.Unlock()
+	h.cmd("fetch_avatar", map[string]any{"jid": alice})
+	if a := field[protocol.Avatar](h.expect(protocol.EvAvatar)); a.State != "hidden" {
+		t.Fatalf("hidden %+v", a)
+	}
+	// At most one query a second, whatever the client asks.
+	f.mu.Lock()
+	at := append([]time.Time(nil), f.pictureAt...)
+	f.mu.Unlock()
+	for i := 1; i < len(at); i++ {
+		if gap := at[i].Sub(at[i-1]); gap < 900*time.Millisecond {
+			t.Fatalf("queries %v apart", gap)
+		}
+	}
+	// Not a picture, or too big: nothing written.
+	f.mu.Lock()
+	delete(f.pictureErr, alice)
+	f.pictures[alice] = &types.ProfilePictureInfo{ID: "2", URL: "https://pps.whatsapp.net/v/html"}
+	f.picBytes["https://pps.whatsapp.net/v/html"] = []byte("<html>not a picture</html>")
+	f.mu.Unlock()
+	h.expectError(h.cmd("fetch_avatar", map[string]any{"jid": alice}), protocol.ErrMediaUnavailable)
+	f.mu.Lock()
+	f.picBytes["https://pps.whatsapp.net/v/html"] = bytes.Repeat([]byte{0xff}, protocol.MaxAvatarBytes+1)
+	f.pictureErr[group] = &whatsmeow.IQError{Code: 429}
+	f.mu.Unlock()
+	h.expectError(h.cmd("fetch_avatar", map[string]any{"jid": alice}), protocol.ErrMediaTooLarge)
+	h.expectError(h.cmd("fetch_avatar", map[string]any{"jid": group}), protocol.ErrRateLimited)
+	entries, _ := os.ReadDir(h.mediaDir)
+	if len(entries) != 1 {
+		t.Fatalf("media dir holds %d files", len(entries))
 	}
 }
