@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -43,10 +44,13 @@ func TestEveryCommandExampleIsAccepted(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: envelope: %v", name, err)
 		}
+		seen[env.Type] = true
+		if runtime.GOOS == "windows" && (env.Type == CmdInit || env.Type == CmdSendMedia) {
+			continue // the examples use Unix absolute paths; Windows needs a drive letter
+		}
 		if _, err := DecodeCommand(env.Type, env.Payload); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		seen[env.Type] = true
 	}
 	for _, c := range Commands() {
 		if !seen[c] {

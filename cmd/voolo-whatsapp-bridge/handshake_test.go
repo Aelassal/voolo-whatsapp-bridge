@@ -314,6 +314,9 @@ func TestBinaryStdinEOF(t *testing.T) {
 		t.Skip("builds the binary")
 	}
 	bin := filepath.Join(t.TempDir(), "bridge")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	build := exec.Command("go", "build", "-trimpath", "-o", bin, ".")
 	build.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := build.CombinedOutput(); err != nil {
