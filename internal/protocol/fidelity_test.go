@@ -49,3 +49,25 @@ func TestHelloAnnouncesFeatures(t *testing.T) {
 		t.Fatalf("features %v", Features())
 	}
 }
+
+// Revision 2, feature forward: one flag, never together with a quote.
+func TestForwardFlag(t *testing.T) {
+	base := `"chatJid":"15550100002@s.whatsapp.net","text":"hi","outboxId":"01M3C03V80N87VFZS5G0J0NFEX"`
+	if err := cmd(CmdSendText, "{"+base+`,"forwarded":true}`); err != nil {
+		t.Fatalf("forward refused: %v", err)
+	}
+	if err := cmd(CmdSendText, "{"+base+`,"forwarded":true,"quotedMessageId":"3EB0K"}`); err == nil {
+		t.Fatal("a forwarded reply accepted")
+	}
+	if err := cmd(CmdSendText, "{"+base+`,"forwarded":"yes"}`); err == nil {
+		t.Fatal("forwarded as a string accepted")
+	}
+	for _, e := range []string{`"forwardTo":["15550100003@s.whatsapp.net"]`, `"forwardChats":2`, `"chatJids":["15550100003@s.whatsapp.net"]`} {
+		if err := cmd(CmdSendText, "{"+base+`,"forwarded":true,`+e+"}"); err == nil {
+			t.Errorf("a forward to several chats accepted: %s", e)
+		}
+	}
+	if !slices.Contains(Features(), FeatureForward) {
+		t.Fatal("forward not announced")
+	}
+}

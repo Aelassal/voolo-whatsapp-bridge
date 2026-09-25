@@ -204,6 +204,10 @@ func (b *Bridge) deliver(s *session, id, outboxID string, to types.JID, msg *waE
 // reported sender. The copy is what WhatsApp's clients show above the reply;
 // it goes only to the chat that already holds the quoted message.
 func (b *Bridge) contextInfo(chat string, q protocol.Quote) *waE2E.ContextInfo {
+	if q.Forwarded {
+		// Forwarded once by this user (PROTOCOL.md §6.5, feature forward).
+		return &waE2E.ContextInfo{IsForwarded: proto.Bool(true), ForwardingScore: proto.Uint32(1)}
+	}
 	if q.QuotedMessageID == "" {
 		return nil
 	}

@@ -92,6 +92,9 @@ type Quote struct {
 	QuotedMessageID string `json:"quotedMessageId,omitempty"`
 	QuotedSenderJID string `json:"quotedSenderJid,omitempty"`
 	QuotedText      string `json:"quotedText,omitempty"`
+	// Forwarded marks the message as forwarded (revision 2, feature
+	// forward). A forward is never also a reply.
+	Forwarded bool `json:"forwarded,omitempty"`
 }
 
 // SendText is the send_text payload.
@@ -167,9 +170,10 @@ var commandSpecs = map[string]commandSpec{
 	CmdShutdown:   {fields: fieldSpec{}, decode: decodeAs[Empty]},
 }
 
-// withQuote adds the optional reply fields of revision 2 to a send's fields.
+// withQuote adds the optional reply and forward fields of revision 2 to a
+// send's fields.
 func withQuote(f fieldSpec) fieldSpec {
-	f["quotedMessageId"], f["quotedSenderJid"], f["quotedText"] = false, false, false
+	f["quotedMessageId"], f["quotedSenderJid"], f["quotedText"], f["forwarded"] = false, false, false, false
 	return f
 }
 
@@ -363,6 +367,9 @@ func validQuote(q *Quote) error {
 	}
 	if q.QuotedText != "" && !textOK(q.QuotedText, 1, MaxQuotedTextChars) {
 		return bad("quotedText")
+	}
+	if q.Forwarded && q.QuotedMessageID != "" {
+		return bad("a forward is not a reply")
 	}
 	return nil
 }

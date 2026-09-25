@@ -4,6 +4,9 @@
 package wa
 
 import (
+	"bytes"
+	"image"
+	"image/jpeg"
 	"testing"
 	"time"
 
@@ -86,4 +89,38 @@ func TestMediaReplyCarriesContext(t *testing.T) {
 	if dm := f.sent[1].msg.GetDocumentMessage(); dm.GetContextInfo().GetStanzaID() != "3EB0K" || dm.GetFileName() != "عقد.pdf" {
 		t.Fatalf("document %v", dm)
 	}
+}
+
+// Feature forward: the message is marked forwarded, text and media alike.
+func TestForwardMarksTheMessage(t *testing.T) {
+	h := newHarness(t, pairedFake)
+	f := h.initPairedConnected()
+	h.knownChat(f)
+	h.cmd("send_text", map[string]any{"chatJid": alice, "text": "forwarded text", "outboxId": "01M3C03V80N87VFZS5G0J0NFEX", "forwarded": true})
+	h.expect(protocol.EvSendResult)
+	et := f.sent[0].msg.GetExtendedTextMessage()
+	if et.GetText() != "forwarded text" || !et.GetContextInfo().GetIsForwarded() || et.GetContextInfo().GetForwardingScore() != 1 ||
+		et.GetContextInfo().GetStanzaID() != "" {
+		t.Fatalf("forward %v", f.sent[0].msg)
+	}
+	h.advance(time.Second)
+	s := sealForTest(t, h.mediaDir, jpegForTest(t))
+	h.cmd("send_media", map[string]any{"chatJid": alice, "outboxId": "01M3C03V80N87VFZS5G0J0NFEY", "kind": "image", "path": s.path,
+		"key": s.key, "sha256": s.sha, "mime": "image/jpeg", "caption": "صورة", "forwarded": true})
+	h.expect(protocol.EvSendResult)
+	im := f.sent[1].msg.GetImageMessage()
+	if !im.GetContextInfo().GetIsForwarded() || im.GetCaption() != "صورة" || im.GetWidth() != 4 {
+		t.Fatalf("image forward %v", im)
+	}
+}
+
+// jpegForTest is a tiny real JPEG (4×2) so the bridge can read its size.
+func jpegForTest(t *testing.T) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 4, 2))
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
 }

@@ -46,11 +46,12 @@ type Hello struct {
 // Features of revision 2 (PROTOCOL.md §5.1), in the order they were added.
 const (
 	FeatureReplyContext = "reply_context"
+	FeatureForward      = "forward"
 )
 
 // Features returns the features this bridge offers.
 func Features() []string {
-	return []string{FeatureReplyContext}
+	return []string{FeatureReplyContext, FeatureForward}
 }
 
 // Account is ready.account.

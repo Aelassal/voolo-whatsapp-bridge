@@ -89,7 +89,7 @@ Examples of every event are in `examples/bridge-to-app/`. Optional fields are ma
 ### 5.1 `hello`
 First line the bridge writes.
 `{bridge: "voolo-whatsapp-bridge", version: "<semver>", protocol: 1, os: "windows|darwin|linux", arch: "amd64|arm64", features?: [string]}`
-*(rev 2)* `features?: string[]`: what this bridge offers beyond the first release of v1. A client MUST NOT send a command or a field that belongs to a feature the bridge did not list; an older bridge lists none (and answers a new command with `unknown_command`). Names so far: `reply_context` (§6.5, §6.6 quote fields).
+*(rev 2)* `features?: string[]`: what this bridge offers beyond the first release of v1. A client MUST NOT send a command or a field that belongs to a feature the bridge did not list; an older bridge lists none (and answers a new command with `unknown_command`). Names so far: `reply_context` (§6.5, §6.6 quote fields), `forward` (§6.5, §6.6 `forwarded`).
 *(review)* `version` is `MAJOR.MINOR.PATCH` without a leading `v` (a development build says `0.0.0-dev`). Versions are compared as three numbers, never with a `v` and never as strings, for example against `flags.json` `maxBridgeVersion` (§11) and release tags (§13).
 
 ### 5.2 `ready` (reply to `init`)
@@ -253,7 +253,7 @@ Unlinks this device on WhatsApp's side, deletes the store and exits. *(review, c
 - Errors: `not_paired`; `not_connected` (retryable; nothing was unlinked); `timeout`; `internal`.
 
 ### 6.5 `send_text`
-`{chatJid, text, outboxId, quotedMessageId?, quotedSenderJid?, quotedText?}`
+`{chatJid, text, outboxId, quotedMessageId?, quotedSenderJid?, quotedText?, forwarded?}`
 - `text`: 1–65,536 characters.
 - `outboxId`: a ULID chosen by the client, one per message the user asked to send.
 - Only **one** send (`send_text` or `send_media`) may be in flight. A second one gets `busy`.
@@ -269,12 +269,14 @@ Unlinks this device on WhatsApp's side, deletes the store and exits. *(review, c
 - *(review)* A panic inside a send is answered with `error {internal}` and frees the slot.
 - *(clarified)* `quotedMessageId` refers to a message in the same chat. The bridge adds the quoted message's author when it has seen that message recently; it does not send a copy of the quoted content.
 - *(rev 2, feature `reply_context`; changes the line above)* `quotedSenderJid?` (a person's JID, §3) names the quoted message's author and `quotedText?` (1–4,096 characters) is a copy of its text, or a label such as `Photo` for media. Both are allowed only together with `quotedMessageId` (else `bad_request`). The bridge builds WhatsApp's reply context: the quoted id; the author as WhatsApp addressed that message when the bridge saw it (in some groups an `@lid`), else `quotedSenderJid`, else the sender the bridge reported; and, when `quotedText` is given, the copy, which WhatsApp's apps show above the reply. The copy goes only to the chat that already holds the quoted message.
+- *(rev 2, feature `forward`)* `forwarded?: bool`: the message is shown as forwarded (WhatsApp's forwarded flag, forwarding score 1). A forward is one message to one chat, like any send: there is no field for a second chat, and the same checks, backstop and "never retried" rules apply. `forwarded: true` together with `quotedMessageId` is `bad_request` (a forward is not a reply). The client sends the forwarded content itself (text, or a media file it holds); the bridge keeps no message content to forward from.
 
 ### 6.6 `send_media`
-`{chatJid, outboxId, kind: "image"|"voice"|"file", path, key, sha256, mime, caption?, fileName?, quotedMessageId?, quotedSenderJid?, quotedText?}`. The client writes the file in the §8 format under `mediaDir` with its own fresh key. The bridge reads, decrypts and checks it, uploads it, deletes the file, and replies. Same rules and errors as §6.5, plus `media_too_large` and `media_invalid`.
+`{chatJid, outboxId, kind: "image"|"voice"|"file", path, key, sha256, mime, caption?, fileName?, quotedMessageId?, quotedSenderJid?, quotedText?, forwarded?}`. The client writes the file in the §8 format under `mediaDir` with its own fresh key. The bridge reads, decrypts and checks it, uploads it, deletes the file, and replies. Same rules and errors as §6.5, plus `media_too_large` and `media_invalid`.
 - *(clarified)* `path` must be `<mediaDir>/<32 lowercase hex>.bin`, a regular file (not a link). It is deleted once read, in every case. *(review)* Also when the command is refused before the file is read (`busy`, `unknown_chat`, `duplicate_outbox_id`, `not_connected`, …). The file is opened once and checked on the open handle, so a path swapped for a link after the check, or a file cut short, gets `media_invalid`. Caps: `image` ≤ `limits.imageMaxBytes`; `voice` ≤ `limits.voiceMaxBytes` and ≤ `limits.voiceMaxSeconds` (read from the file); `file` ≤ 33,554,432 bytes. *(review)* A `voice` must be Ogg Opus (`mime` `audio/ogg`, with or without parameters) whose duration the bridge can read; anything else is `media_invalid`. *(re-review)* The duration is read from a check of every page of the file: one Opus stream that starts with its `OpusHead`, pages that follow each other without gaps or trailing bytes, sequence numbers that increase by one, granule positions that never decrease, nothing after the end-of-stream page. A file that fails any of this is `media_invalid`. The duration is the largest granule minus the pre-skip, and never less than the file's size divided by 72,000 bytes per second (Opus's highest bitrate plus the Ogg framing). `voice` is sent as a voice note (push-to-talk). `mime`: `type/subtype` with optional parameters, for example `audio/ogg; codecs=opus`.
 - *(added within v1)* `fileName?`: 1–255 characters, no `/`, `\` or control characters; the name shown for `kind: file` (default `file` plus an extension from `mime`).
 - *(rev 2, feature `reply_context`)* `quotedMessageId?`, `quotedSenderJid?`, `quotedText?`: as in §6.5; any kind can be a reply.
+- *(rev 2, feature `forward`)* `forwarded?`: as in §6.5.
 
 ### 6.7 `mark_read`
 `{chatJid, messageIds: [id] (1–50), senderJid?}`. Sends read receipts for these received messages (`senderJid` is required in groups). WhatsApp applies the user's own read-receipt privacy setting. *(clarified)* In a group, all `messageIds` must be from that one `senderJid`; send one `mark_read` per sender. A group `mark_read` without `senderJid` is `bad_request`. *(review)* Only for a chat the bridge has reported (as for sends, §6.5), otherwise `unknown_chat`; and if the bridge knows that one of the `messageIds` was written by someone other than `senderJid`, `bad_request`. Errors: `not_paired`, `not_connected`, `unknown_chat`, `bad_request`, `timeout`, `internal`.
