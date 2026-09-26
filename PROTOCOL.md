@@ -19,6 +19,7 @@ This document is the complete interface of `voolo-whatsapp-bridge`. A client nee
 - **Changes from the P1-A security review** (2026-09-25, before the first release; marked *(review)*): a logout ends the process and the store is never reopened with the same key (§5.9, §6.4); exit codes 6 and 7, and 2 is left to the Go runtime (§4, §9); a compiled-in send backstop with the new error `rate_limited_local` (§6.5, §9); `client_outdated` is signalled only after the bridge's own refresh and retry fail (§5.4); stricter input (invalid UTF-8, ULID range; §2), `mark_read` only for reported chats (§6.7), voice notes read from the file (§6.6, §6.8, §8), bounded media downloads (§6.8, §8), the stderr event list (§10.4), release file names and versions (§13), and corrections of three statements about WhatsApp's behaviour (§5.4, §6.2, §10.3). Known limits are in §14.
 - **Changes from the P1-A security re-review and the lead's decisions** (2026-09-25, before the first release; marked *(re-review)*): nothing but the final lines reaches stdout once the bridge stops, and a command still running then gets no reply (§6.11); only sends handed to WhatsApp count toward the backstop, which also survives the clock going back (§6.5); a logout confirmed during a shutdown still deletes the store (§6.4, §9); a failed store deletion still exits 7 (§6.4); voice durations from a check of the whole Ogg file (§6.6, §6.8); more refused address ranges (§10.2); stderr goes to the null device (§10.4, §14); `paired` is matched by state (§5.7); every `fatal` error names its exit code (§5.22); output is always valid UTF-8 (§1); stderr codes are their own namespace (§10.4).
 - **Revision 2** (2026-09-25, WhatsApp fidelity; marked *(rev 2)*): additions within v1 only — every new field is optional and every new command is announced in `hello.features` (§5.1), so a client that does not know them is unaffected and a client never sends what the bridge does not list. The envelope's `v` and `hello.protocol` stay `1`.
+- **Revision 3** (2026-09-26, linked-id names; marked *(rev 3)*, feature `lid_names`): WhatsApp now writes many mentions as `@<linked id digits>` and names the person by `@lid`. Additive fields let a client show a name: `ready.account.lid` (§5.2), `contact.lid` (§5.13), `group.participants[].lid` (§5.14) and `message.mentionLids` (§5.15); `contact` is also sent for mentioned people (§5.13). Nothing is removed or changed; the text of a message is never rewritten.
 - Words in capitals (MUST, MUST NOT, SHOULD) have their usual meaning.
 
 ## 1. Transport
@@ -89,11 +90,12 @@ Examples of every event are in `examples/bridge-to-app/`. Optional fields are ma
 ### 5.1 `hello`
 First line the bridge writes.
 `{bridge: "voolo-whatsapp-bridge", version: "<semver>", protocol: 1, os: "windows|darwin|linux", arch: "amd64|arm64", features?: [string]}`
-*(rev 2)* `features?: string[]`: what this bridge offers beyond the first release of v1. A client MUST NOT send a command or a field that belongs to a feature the bridge did not list; an older bridge lists none (and answers a new command with `unknown_command`). Names so far: `reply_context` (§6.5, §6.6 quote fields), `forward` (§6.5, §6.6 `forwarded`), `send_video` (§6.1 `videoMaxBytes`/`fileMaxBytes`, §6.6 `kind: video`), `fetch_all_media` (§6.8 videos, stickers, documents, audio), `set_pin` (§6.12), `voice_waveform` (§6.6 `waveform`), `avatar` (§5.23, §6.13).
+*(rev 2)* `features?: string[]`: what this bridge offers beyond the first release of v1. A client MUST NOT send a command or a field that belongs to a feature the bridge did not list; an older bridge lists none (and answers a new command with `unknown_command`). Names so far: `reply_context` (§6.5, §6.6 quote fields), `forward` (§6.5, §6.6 `forwarded`), `send_video` (§6.1 `videoMaxBytes`/`fileMaxBytes`, §6.6 `kind: video`), `fetch_all_media` (§6.8 videos, stickers, documents, audio), `set_pin` (§6.12), `voice_waveform` (§6.6 `waveform`), `avatar` (§5.23, §6.13). *(rev 3)* `lid_names` (§5.2, §5.13–§5.15: linked ids next to phone numbers; events only, no command).
 *(review)* `version` is `MAJOR.MINOR.PATCH` without a leading `v` (a development build says `0.0.0-dev`). Versions are compared as three numbers, never with a `v` and never as strings, for example against `flags.json` `maxBridgeVersion` (§11) and release tags (§13).
 
 ### 5.2 `ready` (reply to `init`)
-`{replyTo, paired: bool, account?: {jid, pushName?}}`. When `paired` is true, the bridge starts connecting immediately.
+`{replyTo, paired: bool, account?: {jid, lid?, pushName?}}`. When `paired` is true, the bridge starts connecting immediately.
+*(rev 3)* `account.lid?`: the account's own linked id (`<digits>@lid`), when the store knows it, so a client can recognise mentions of the user written by linked id.
 
 ### 5.3 `status`
 The connection state, sent on every change.
@@ -153,10 +155,13 @@ A partial change to one chat. Only the fields that changed are present.
 - *(clarified)* `mutedUntil: 0` means the chat was unmuted; `-1` means muted forever.
 
 ### 5.13 `contact`
-`{jid, name?, pushName?, businessName?}`: a display name for a person who appears in a reported chat or as a group sender. The bridge never reports the whole address book.
+`{jid, name?, pushName?, businessName?, lid?}`: a display name for a person who appears in a reported chat or as a group sender. The bridge never reports the whole address book.
+- *(rev 3)* `lid?`: the person's linked id, when `jid` is their phone-number JID and the store knows both.
+- *(rev 3)* A person **mentioned** in a reported message (§5.15 `mentions`) also appears in that chat: the bridge reports their `contact` once per run, like a group sender, when it knows a name. The user's own JID is never reported as a contact.
 
 ### 5.14 `group`
-`{jid, name, topic?, participants: [{jid, isAdmin?}] (max 2,048)}`, sent when a group chat is first reported and when its membership or subject changes.
+`{jid, name, topic?, participants: [{jid, lid?, isAdmin?}] (max 2,048)}`, sent when a group chat is first reported and when its membership or subject changes.
+*(rev 3)* A member's `jid` is their phone-number JID when WhatsApp or the store knows it, else their `@lid` JID; `lid?` is the member's linked id next to a phone-number `jid` when both are known.
 
 ### 5.15 `message`
 One message, new or updated, live or from the phone's other devices (including your own sent messages).
@@ -173,12 +178,13 @@ One message, new or updated, live or from the phone's other devices (including y
 | `text?` | string | body, or the caption of a media message |
 | `pushName?` | string | the sender's own chosen name |
 | `quoted?` | `{id, senderJid?}` | the message this one replies to |
-| `mentions?` | JID[] (max 64) | |
+| `mentions?` | JID[] (max 64) | the mentioned people, each by phone-number JID when known, else by `@lid` JID |
+| `mentionLids?` | `[{lid, jid}]` (max 64) | *(rev 3)* for each mention WhatsApp wrote by linked id (the text holds `@<lid digits>`) whose phone number is known: the `@lid` JID and the phone-number JID that `mentions` reports for it. A mention by phone number, or by an `@lid` whose number is unknown, has no pair. |
 | `forwarded?` | bool | |
 | `edited?` | bool | already reflects an edit (history) |
 | `media?` | `{mime, sizeBytes, durationS?, width?, height?, fileName?}` | a description only; fetch with `fetch_media` |
 
-*(clarified)* What v1 reports: view-once messages as `unsupported` with no `media` (they can never be fetched, as in WhatsApp Web); `location` and `contact` without `text` (a contact card's phone numbers are never reported); `poll` with the question as `text`; a message that cannot be decrypted as `unsupported` (a later `message` with the same id replaces it if WhatsApp re-sends it). System notices without a body (for example "X joined") are not reported in v1, so `system` is reserved. Reactions and poll votes are not messages: reactions arrive as `reaction`, poll votes are not reported.
+*(clarified)* What v1 reports: view-once messages as `unsupported` with no `media` (they can never be fetched, as in WhatsApp Web); `location` and `contact` without `text` (a contact card's phone numbers are never reported); `poll` with the question as `text`; a message that cannot be decrypted as `unsupported` (a later `message` with the same id replaces it if WhatsApp re-sends it). System notices without a body (for example "X joined") are not reported in v1, so `system` is reserved. *(rev 3)* A mention appears in `text` as WhatsApp's apps wrote it, `@` followed by the digits of the mentioned JID (a phone number or a linked id); the bridge never rewrites the text. A client finds the person of `@<digits>` in `mentions` (same digits), or through `mentionLids` when the digits are a linked id. Reactions and poll votes are not messages: reactions arrive as `reaction`, poll votes are not reported.
 
 ### 5.16 `message_update`
 `{chatJid, messageId, kind: "edit"|"revoke", text?, at, by?}`. `edit` carries the new `text`. `revoke` means "deleted for everyone"; `by` is the JID that deleted it.

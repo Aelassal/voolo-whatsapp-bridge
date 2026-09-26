@@ -67,6 +67,8 @@ type Client interface {
 
 	Account() AccountInfo
 	PNForLID(ctx context.Context, lid types.JID) types.JID
+	// LIDForPN is the reverse lookup (revision 3, lid_names).
+	LIDForPN(ctx context.Context, pn types.JID) types.JID
 	Contact(ctx context.Context, jid types.JID) types.ContactInfo
 }
 
@@ -113,6 +115,17 @@ func (c realClient) PNForLID(ctx context.Context, lid types.JID) types.JID {
 		return types.EmptyJID
 	}
 	return pn.ToNonAD()
+}
+
+func (c realClient) LIDForPN(ctx context.Context, pn types.JID) types.JID {
+	if c.Store == nil || c.Store.LIDs == nil {
+		return types.EmptyJID
+	}
+	lid, err := c.Store.LIDs.GetLIDForPN(ctx, pn)
+	if err != nil {
+		return types.EmptyJID
+	}
+	return lid.ToNonAD()
 }
 
 func (c realClient) Contact(ctx context.Context, jid types.JID) types.ContactInfo {

@@ -393,6 +393,9 @@ func (b *Bridge) doInit(id string, c *protocol.Init) {
 	ready := protocol.Ready{ReplyTo: id, Paired: !acct.JID.IsEmpty()}
 	if ready.Paired {
 		ready.Account = &protocol.Account{JID: acct.JID.String(), PushName: truncate(acct.PushName, protocol.MaxNameChars)}
+		if acct.LID.Server == types.HiddenUserServer && acct.LID.User != "" {
+			ready.Account.LID = acct.LID.String()
+		}
 	}
 	b.emit(protocol.EvReady, ready)
 	b.cfg.Log.Info("ready")

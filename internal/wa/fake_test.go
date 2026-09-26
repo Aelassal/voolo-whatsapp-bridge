@@ -313,6 +313,17 @@ func (f *fakeClient) PNForLID(_ context.Context, lid types.JID) types.JID {
 	return f.pnForLID[lid.String()]
 }
 
+func (f *fakeClient) LIDForPN(_ context.Context, pn types.JID) types.JID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for lid, p := range f.pnForLID {
+		if p == pn {
+			return mustParse(lid)
+		}
+	}
+	return types.EmptyJID
+}
+
 func (f *fakeClient) Contact(_ context.Context, j types.JID) types.ContactInfo {
 	f.mu.Lock()
 	defer f.mu.Unlock()

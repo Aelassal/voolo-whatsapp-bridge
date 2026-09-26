@@ -273,16 +273,20 @@ func (b *Bridge) historyConversation(s *session, syncType string, conv *waHistor
 		if isGroup && !m.FromMe {
 			senders[m.SenderJID] = true
 		}
+		// Revision 3: mentioned people get their name too.
+		for _, j := range m.Mentions {
+			senders[j] = true
+		}
 	}
 	if ctx.Err() != nil {
 		return
 	}
 	if isGroup {
 		b.ensureGroup(s, chat)
-		for j := range senders {
-			b.ensureContact(ctx, s, j)
-		}
 	} else {
 		b.ensureContact(ctx, s, chat)
+	}
+	for j := range senders {
+		b.ensureContact(ctx, s, j)
 	}
 }

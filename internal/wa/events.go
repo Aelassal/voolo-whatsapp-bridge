@@ -295,6 +295,11 @@ func (b *Bridge) sendContact(ctx context.Context, s *session, jid string) {
 	if c.Name == "" && c.PushName == "" && c.BusinessName == "" {
 		return
 	}
+	if j.Server == types.DefaultUserServer {
+		if lid := s.cli.LIDForPN(ctx, j); lid.Server == types.HiddenUserServer && lid.User != "" {
+			c.LID = lid.String()
+		}
+	}
 	b.mu.Lock()
 	b.contacts[jid] = true
 	b.mu.Unlock()
@@ -392,6 +397,10 @@ func (b *Bridge) toMessage(ctx context.Context, s *session, e *events.Message, c
 		if mj, err := types.ParseJID(raw); err == nil {
 			if u := b.userJID(ctx, s, mj, types.EmptyJID); protocol.IsUserJID(u) {
 				m.Mentions = append(m.Mentions, u)
+				// Revision 3: the text says "@<lid digits>"; name the pair.
+				if lid := mj.ToNonAD(); lid.Server == types.HiddenUserServer && lid.String() != u {
+					m.MentionLIDs = append(m.MentionLIDs, protocol.MentionLID{LID: lid.String(), JID: u})
+				}
 			}
 		}
 	}
@@ -477,6 +486,10 @@ func (b *Bridge) onMessage(s *session, e *events.Message) {
 	if e.Info.IsGroup && !m.FromMe {
 		b.ensureContact(ctx, s, m.SenderJID)
 	}
+	// Revision 3: a mentioned person appears in this chat; their name, once.
+	for _, j := range m.Mentions {
+		b.ensureContact(ctx, s, j)
+	}
 }
 
 func (b *Bridge) onUndecryptable(s *session, e *events.UndecryptableMessage) {
@@ -506,21 +519,36 @@ func (b *Bridge) onUndecryptable(s *session, e *events.UndecryptableMessage) {
 
 // Groups ---------------------------------------------------------------
 
-func groupEvent(gi *types.GroupInfo) protocol.Group {
+// groupEvent maps group metadata. Members are named by phone number when it
+// is known (from WhatsApp or the store); revision 3 adds the linked id next
+// to it, so a client can name "@<lid>" mentions.
+func (b *Bridge) groupEvent(ctx context.Context, s *session, gi *types.GroupInfo) protocol.Group {
 	g := protocol.Group{JID: gi.JID.ToNonAD().String(), Name: truncate(gi.Name, protocol.MaxNameChars), Topic: truncate(gi.Topic, protocol.MaxNameChars), Participants: []protocol.Participant{}}
 	for _, p := range gi.Participants {
 		if len(g.Participants) >= protocol.MaxParticipants {
 			break
 		}
-		j := p.JID
-		if !p.PhoneNumber.IsEmpty() {
-			j = p.PhoneNumber
+		lid := p.LID.ToNonAD()
+		if p.JID.Server == types.HiddenUserServer {
+			lid = p.JID.ToNonAD()
 		}
-		js := j.ToNonAD().String()
+		j := p.JID.ToNonAD()
+		if !p.PhoneNumber.IsEmpty() {
+			j = p.PhoneNumber.ToNonAD()
+		} else if j.Server == types.HiddenUserServer {
+			if pn := s.cli.PNForLID(ctx, j); !pn.IsEmpty() {
+				j = pn
+			}
+		}
+		js := j.String()
 		if !protocol.IsUserJID(js) {
 			continue
 		}
-		g.Participants = append(g.Participants, protocol.Participant{JID: js, IsAdmin: p.IsAdmin || p.IsSuperAdmin})
+		part := protocol.Participant{JID: js, IsAdmin: p.IsAdmin || p.IsSuperAdmin}
+		if j.Server == types.DefaultUserServer && lid.Server == types.HiddenUserServer && lid.User != "" {
+			part.LID = lid.String()
+		}
+		g.Participants = append(g.Participants, part)
 	}
 	return g
 }
@@ -539,7 +567,7 @@ func (b *Bridge) ensureGroup(s *session, jid string) {
 	}
 	b.mu.Unlock()
 	if gi != nil {
-		b.emit(protocol.EvGroup, groupEvent(gi))
+		b.emit(protocol.EvGroup, b.groupEvent(s.ctx, s, gi))
 		return
 	}
 	if loaded {
@@ -573,7 +601,7 @@ func (b *Bridge) refreshGroup(s *session, j types.JID, changed bool) {
 	b.groupCache[jid] = gi
 	b.groupsSent[jid] = true
 	b.mu.Unlock()
-	b.emit(protocol.EvGroup, groupEvent(gi))
+	b.emit(protocol.EvGroup, b.groupEvent(ctx, s, gi))
 	if changed && old != nil && old.Name != gi.Name {
 		name := truncate(gi.Name, protocol.MaxNameChars)
 		b.emit(protocol.EvChatUpdate, protocol.ChatUpdate{JID: jid, Name: &name})

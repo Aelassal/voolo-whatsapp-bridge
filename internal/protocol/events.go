@@ -53,16 +53,21 @@ const (
 	FeatureSetPin       = "set_pin"
 	FeatureWaveform     = "voice_waveform"
 	FeatureAvatar       = "avatar"
+	// FeatureLIDNames is revision 3 (PROTOCOL.md §5.2, §5.13–§5.15): linked
+	// ids next to phone numbers, so a client can name @lid mentions.
+	FeatureLIDNames = "lid_names"
 )
 
 // Features returns the features this bridge offers.
 func Features() []string {
-	return []string{FeatureReplyContext, FeatureForward, FeatureSendVideo, FeatureFetchAll, FeatureSetPin, FeatureWaveform, FeatureAvatar}
+	return []string{FeatureReplyContext, FeatureForward, FeatureSendVideo, FeatureFetchAll, FeatureSetPin, FeatureWaveform, FeatureAvatar, FeatureLIDNames}
 }
 
 // Account is ready.account.
 type Account struct {
-	JID      string `json:"jid"`
+	JID string `json:"jid"`
+	// LID is the account's own linked id (revision 3), when known.
+	LID      string `json:"lid,omitempty"`
 	PushName string `json:"pushName,omitempty"`
 }
 
@@ -199,11 +204,17 @@ type Contact struct {
 	Name         string `json:"name,omitempty"`
 	PushName     string `json:"pushName,omitempty"`
 	BusinessName string `json:"businessName,omitempty"`
+	// LID is the person's linked id when JID is their phone number and the
+	// store knows both (revision 3).
+	LID string `json:"lid,omitempty"`
 }
 
 // Participant is one group member.
 type Participant struct {
-	JID     string `json:"jid"`
+	JID string `json:"jid"`
+	// LID is the member's linked id when JID is their phone number and both
+	// are known (revision 3).
+	LID     string `json:"lid,omitempty"`
 	IsAdmin bool   `json:"isAdmin,omitempty"`
 }
 
@@ -250,8 +261,15 @@ type Media struct {
 	FileName  string `json:"fileName,omitempty"`
 }
 
-// MaxMentions caps message.mentions.
+// MaxMentions caps message.mentions (and message.mentionLids).
 const MaxMentions = 64
+
+// MentionLID pairs a mention written by linked id with the phone-number JID
+// reported for it in mentions (revision 3).
+type MentionLID struct {
+	LID string `json:"lid"`
+	JID string `json:"jid"`
+}
 
 // Message is §5.15.
 type Message struct {
@@ -265,9 +283,12 @@ type Message struct {
 	PushName  string   `json:"pushName,omitempty"`
 	Quoted    *Quoted  `json:"quoted,omitempty"`
 	Mentions  []string `json:"mentions,omitempty"`
-	Forwarded bool     `json:"forwarded,omitempty"`
-	Edited    bool     `json:"edited,omitempty"`
-	Media     *Media   `json:"media,omitempty"`
+	// MentionLIDs (revision 3): for each mention WhatsApp wrote as
+	// "@<lid digits>" whose phone number is known, the pair.
+	MentionLIDs []MentionLID `json:"mentionLids,omitempty"`
+	Forwarded   bool         `json:"forwarded,omitempty"`
+	Edited      bool         `json:"edited,omitempty"`
+	Media       *Media       `json:"media,omitempty"`
 }
 
 // MessageEvent is the message event payload.
